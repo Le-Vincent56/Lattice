@@ -256,7 +256,7 @@ full requested-type chain.
 
 ## Compatibility and contributing
 
-- Targets Unity 6 and compiles under its default C# 9. The package uses block-scoped
+- Targets Unity 6000.4.5f1 or newer, and compiles under Unity's default C# 9. The package uses block-scoped
   namespaces deliberately so it needs no project `csc.rsp` and no patched editor.
 - `init`-only setters are supported via an in-package `IsExternalInit` polyfill.
 - Namespaces are set explicitly (folder-aligned under `Didionysymus.Lattice`). Do not run an

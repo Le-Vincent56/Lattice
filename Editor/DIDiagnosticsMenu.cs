@@ -26,7 +26,8 @@ namespace Didionysymus.Lattice.Editor
             if (!Application.isPlaying)
             {
                 Debug.LogWarning(
-                    "[Lattice] Dump Active Scope Tree requires Play Mode (no live container in Edit mode).");
+                    "[Lattice] Dump Active Scope Tree requires Play Mode (no live container in Edit mode)."
+                );
                 return;
             }
 

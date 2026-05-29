@@ -1,9 +1,10 @@
 {
   "name": "com.didionysymus.lattice",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "displayName": "Lattice",
   "description": "A small, owned dependency-injection container for Unity. Pure C# core, a Unity adapter, and Editor diagnostics. IL2CPP-safe by design with zero third-party dependencies. Three lifetimes, parent/child scope hierarchy, multi-binding, decorators, open generics, member injection, and lifecycle hooks.",
-  "unity": "6000.0",
+  "unity": "6000.4",
+  "unityRelease": "5f1",
   "type": "library",
   "keywords": [
     "dependency-injection",
