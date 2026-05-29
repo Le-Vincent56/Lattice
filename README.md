@@ -17,11 +17,11 @@ and an Editor assembly adds diagnostics. IL2CPP-safe by design.
 Add the package via its Git URL. In `Packages/manifest.json`:
 
 ```json
-"com.didionysymus.lattice": "https://github.com/<owner>/lattice.git#v1.0.0"
+"com.didionysymus.lattice": "https://github.com/Le-Vincent56/Lattice.git#v1.0.0"
 ```
 
 Or in the Editor: Window > Package Manager > Add package from git URL, then paste
-`https://github.com/<owner>/lattice.git#v1.0.0`.
+`https://github.com/Le-Vincent56/Lattice.git#v1.0.0`.
 
 To run the package's own tests in a consuming project, add it to `testables`:
 
