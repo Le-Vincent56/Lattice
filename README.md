@@ -21,7 +21,7 @@ Add the package via its Git URL. In `Packages/manifest.json`:
 ```
 
 Or in the Editor: Window > Package Manager > Add package from git URL, then paste
-`https://github.com/Le-Vincent56/Lattice.git#v1.0.0`.
+`https://github.com/Le-Vincent56/Lattice.git#v1.x.x`.
 
 To run the package's own tests in a consuming project, add it to `testables`:
 
