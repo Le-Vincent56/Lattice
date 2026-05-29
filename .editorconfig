@@ -1,0 +1,11 @@
+# Self-contained style for the Lattice package. root = true so these rules
+# do not inherit from (or leak into) the consuming project.
+root = true
+
+[*.cs]
+# Block-scoped namespaces are required. File-scoped namespaces need C# 10, which does
+# not reach Packages/ assemblies without a csc.rsp or a patched editor; this package
+# targets Unity 6's default C# 9 so it drops cleanly into any Unity 6 project.
+csharp_style_namespace_declarations = block_scoped:warning
+indent_style = space
+indent_size = 4
