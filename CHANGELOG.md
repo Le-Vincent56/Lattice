@@ -3,6 +3,8 @@
 All notable changes to this package are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/), versioning per [SemVer](https://semver.org/).
 
+## [Unreleased]
+
 ## [1.0.2] - 2026-05-29
 - Added LICENSE.md meta file to prevent Unity package import errors.
 
