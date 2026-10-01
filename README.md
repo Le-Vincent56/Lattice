@@ -123,6 +123,18 @@ IReadOnlyList<IValidationRule> rules = resolver.ResolveAll<IValidationRule>();
 Constructor parameters typed `IReadOnlyList<T>`, `IEnumerable<T>`, or `T[]` are
 auto-resolved via `ResolveAll<T>()`.
 
+### Aliases
+
+`As<T>()`, `AsSelf()` and `AsImplementedInterfaces()` bind more service types to one registration. Every alias of a
+`Singleton` or `Scoped` registration resolves the same instance. Decorators apply per service type: an alias with a
+decorator chain returns that chain around the shared instance, and other aliases return the instance undecorated.
+Two separate `Register` calls stay two registrations with two instances.
+
+```csharp
+builder.Register<AudioService>(Lifetime.Singleton).As<IAudioService>().As<IVolumeControl>();
+// Resolve<AudioService>(), Resolve<IAudioService>() and Resolve<IVolumeControl>() return one AudioService.
+```
+
 ## Decorators
 
 ```csharp
@@ -133,6 +145,9 @@ builder.RegisterDecorator<IFoo, FooMetrics>(Lifetime.Scoped);
 // Resolve<IFoo>() returns FooMetrics(FooLogger(RealFoo)).
 // Last registered is outermost. Each decorator takes the wrapped service as its first ctor param.
 ```
+
+The container initializes and disposes the decorated inner instance as well as each decorator, so a decorator must
+not forward `Initialize` or `Dispose` to the instance it wraps; forwarding would run each call on the inner twice.
 
 ## Open generics
 

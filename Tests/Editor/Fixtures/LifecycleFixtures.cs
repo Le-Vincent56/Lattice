@@ -72,4 +72,33 @@ namespace Didionysymus.Lattice.Tests.Editor.Fixtures
             Order.Add($"{_label}:exit");
         }
     }
+
+    /// <summary>
+    /// <see cref="IAsyncStartable"/> whose instances are all equal by <see cref="Equals(object)"/> and share one hash
+    /// code while remaining distinct objects. Counts <see cref="StartAsync"/> calls across every instance in a static
+    /// field; tests reset <see cref="StartCount"/> in <c>[SetUp]</c>.
+    /// </summary>
+    public sealed class ValueEqualStartable : IAsyncStartable
+    {
+        public static int StartCount;
+
+        public Task StartAsync(CancellationToken cancellationToken)
+        {
+            StartCount++;
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Treats every instance of this type as equal, so only reference identity can tell two instances apart.
+        /// </summary>
+        /// <param name="obj">The object to compare with.</param>
+        /// <returns>True when <paramref name="obj"/> is any <see cref="ValueEqualStartable"/>.</returns>
+        public override bool Equals(object obj) => obj is ValueEqualStartable;
+
+        /// <summary>
+        /// Returns one hash code for every instance, consistent with <see cref="Equals(object)"/>.
+        /// </summary>
+        /// <returns>A constant.</returns>
+        public override int GetHashCode() => 1;
+    }
 }

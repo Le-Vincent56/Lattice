@@ -37,3 +37,15 @@ cannot be reused in a child unless every registration in it is Scoped, Transient
 
 What to do: change the registration to `Lifetime.Scoped`. The child observes the same single instance, now disposed
 with the child. `RegisterInstance` in a child is still allowed.
+
+### Aliases share one instance
+
+Every `As<T>()`, `AsSelf()` and `AsImplementedInterfaces()` alias of a Singleton or Scoped registration now
+resolves the same instance. Previously each alias built and cached its own. Decorators still apply per service
+type: resolving a decorated alias returns the decorator around the shared instance, and resolving any other alias
+returns the shared instance undecorated. The inner instance of a decorated service is now disposed with its scope and
+initialized by `RunInitializables`, and `RunAsyncStartablesAsync` starts an aliased instance once per call.
+
+What to do: if code relied on two aliases being two objects, register the implementation twice with two `Register`
+calls instead of aliasing. If a decorator forwards `Initialize` or `Dispose` to the instance it wraps, stop
+forwarding: the container now makes both calls on the inner instance itself, so forwarding runs each one twice.

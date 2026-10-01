@@ -57,5 +57,47 @@ namespace Didionysymus.Lattice.Tests.Editor.Lifecycle
 
             Assert.IsTrue(b.OtherWasReady, "Phase 2 sees Phase 1 bindings complete across the scope.");
         }
+
+        /// <summary>
+        /// A decorated Scoped service is two cached objects; <c>RunInitializables</c> initializes the implementation
+        /// and the decorator once each.
+        /// </summary>
+        [Test]
+        public void RunInitializables_WhenDecoratedScopedInitialized_InnerAndWrapperBothInitialized()
+        {
+            using IObjectResolver resolver = Container.Build(b =>
+            {
+                b.Register<ILoggable, TrackedLoggable>(Lifetime.Scoped);
+                b.RegisterDecorator<ILoggable, TrackedLoggableDecorator>(Lifetime.Scoped);
+            });
+            TrackedLoggableDecorator decorator = (TrackedLoggableDecorator)resolver.Resolve<ILoggable>();
+            TrackedLoggable inner = (TrackedLoggable)decorator.Inner;
+
+            resolver.RunInitializables();
+
+            Assert.AreEqual(1, decorator.InitializeCount, "The decorator is initialized once");
+            Assert.AreEqual(1, inner.InitializeCount, "The decorated inner instance is initialized once");
+        }
+
+        /// <summary>
+        /// The root walks its decorated Singleton cache too: a decorated Singleton's implementation and decorator are
+        /// initialized once each.
+        /// </summary>
+        [Test]
+        public void RunInitializables_WhenDecoratedSingletonInitialized_InnerAndWrapperBothInitialized()
+        {
+            using IObjectResolver resolver = Container.Build(b =>
+            {
+                b.Register<ILoggable, TrackedLoggable>(Lifetime.Singleton);
+                b.RegisterDecorator<ILoggable, TrackedLoggableDecorator>(Lifetime.Singleton);
+            });
+            TrackedLoggableDecorator decorator = (TrackedLoggableDecorator)resolver.Resolve<ILoggable>();
+            TrackedLoggable inner = (TrackedLoggable)decorator.Inner;
+
+            resolver.RunInitializables();
+
+            Assert.AreEqual(1, decorator.InitializeCount, "The Singleton decorator is initialized once");
+            Assert.AreEqual(1, inner.InitializeCount, "The decorated Singleton's inner instance is initialized once");
+        }
     }
 }

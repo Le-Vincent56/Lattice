@@ -7,9 +7,9 @@ namespace Didionysymus.Lattice.Runtime.Internal
     /// <summary>
     /// Concrete <see cref="IRegistration"/> returned to user code by <see cref="ContainerBuilder"/>.
     /// On construction, registers itself in the <see cref="Registry"/> under the initial service type.
-    /// Subsequent fluent calls (<c>As&lt;T&gt;()</c>, <c>AsSelf()</c>, <c>AsImplementedInterfaces()</c>)
-    /// add additional service-type aliases that all share the same activator, lifetime, and instance;
-    /// so resolving any of the bound service types yields the same Singleton/Scoped instance.
+    /// Subsequent fluent calls (<c>As&lt;T&gt;()</c>, <c>AsSelf()</c>, <c>AsImplementedInterfaces()</c>) add
+    /// service-type aliases whose entries name this registration's first entry as their primary, so resolving any of
+    /// them yields the same Singleton or Scoped implementation instance. Decorators still apply per service type.
     /// </summary>
     internal sealed class Registration : IRegistration
     {
@@ -89,13 +89,12 @@ namespace Didionysymus.Lattice.Runtime.Internal
         }
 
         /// <summary>
-        /// Internal helper that registers a new <see cref="RegistrationEntry"/> for the
-        /// given service type, sharing the same activator and instance as the original entry. Skips duplicates
-        /// so the fluent API stays idempotent.
+        /// Registers a new <see cref="RegistrationEntry"/> for <paramref name="serviceType"/> that shares this
+        /// registration's activator, lifetime and instance and names this registration's first entry as its primary.
+        /// Skips a service type already bound, so the fluent API stays idempotent.
         /// </summary>
-        /// <typeparam name="TService">The type of the service to register.</typeparam>
-        /// <returns>The current registration instance updated with the specified service type mapping.</returns>
-        /// <exception cref="DependencyResolutionException">Thrown when the implementation type does not implement or inherit from the specified service type.</exception>
+        /// <param name="serviceType">The service type to bind to this registration.</param>
+        /// <returns>This registration, for chaining.</returns>
         private IRegistration As(Type serviceType)
         {
             if (_serviceTypes.Contains(serviceType)) return this;
@@ -106,7 +105,8 @@ namespace Didionysymus.Lattice.Runtime.Internal
                 _implType,
                 _lifetime,
                 _activator,
-                _instance
+                _instance,
+                _entry
             ));
             return this;
         }

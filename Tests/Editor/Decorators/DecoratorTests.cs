@@ -73,5 +73,67 @@ namespace Didionysymus.Lattice.Tests.Editor.Decorators
 
             Assert.AreSame(first, second, "Repeated Resolve calls should return the same inner-decorator reference");
         }
+
+        /// <summary>
+        /// A decorated alias wraps the registration's shared instance: <c>AsSelf()</c> resolves the undecorated
+        /// implementation, and the decorator resolved through the decorated service type holds that same object.
+        /// </summary>
+        [Test]
+        public void Resolve_WhenAliasIsDecorated_WrapperWrapsSharedInstance()
+        {
+            using IObjectResolver resolver = Container.Build(b =>
+            {
+                b.Register<ILoggable, TrackedLoggable>(Lifetime.Scoped).AsSelf();
+                b.RegisterDecorator<ILoggable, TrackedLoggableDecorator>(Lifetime.Scoped);
+            });
+
+            TrackedLoggable undecorated = resolver.Resolve<TrackedLoggable>();
+            ILoggable decorated = resolver.Resolve<ILoggable>();
+
+            Assert.IsInstanceOf<TrackedLoggableDecorator>(decorated, "The decorated service type returns its decorator");
+            Assert.AreSame(undecorated, ((TrackedLoggableDecorator)decorated).Inner,
+                "The decorator wraps the same instance the undecorated alias resolves");
+        }
+
+        /// <summary>
+        /// A decorated alias caches its wrapper: resolving it again, with another alias resolved in between, returns
+        /// the same decorator.
+        /// </summary>
+        [Test]
+        public void Resolve_WhenDecoratedAliasResolvedTwice_ReturnsSameWrapper()
+        {
+            using IObjectResolver resolver = Container.Build(b =>
+            {
+                b.Register<ILoggable, TrackedLoggable>(Lifetime.Scoped).AsSelf();
+                b.RegisterDecorator<ILoggable, TrackedLoggableDecorator>(Lifetime.Scoped);
+            });
+
+            ILoggable first = resolver.Resolve<ILoggable>();
+            _ = resolver.Resolve<TrackedLoggable>();
+            ILoggable second = resolver.Resolve<ILoggable>();
+
+            Assert.AreSame(first, second, "The decorated alias returns its cached wrapper");
+        }
+
+        /// <summary>
+        /// The Singleton path uses the root's own pair of caches: a decorated Singleton alias wraps the same instance
+        /// the undecorated <c>AsSelf()</c> alias resolves.
+        /// </summary>
+        [Test]
+        public void Resolve_WhenSingletonAliasIsDecorated_WrapperWrapsSharedInstance()
+        {
+            using IObjectResolver resolver = Container.Build(b =>
+            {
+                b.Register<ILoggable, TrackedLoggable>(Lifetime.Singleton).AsSelf();
+                b.RegisterDecorator<ILoggable, TrackedLoggableDecorator>(Lifetime.Singleton);
+            });
+
+            TrackedLoggable undecorated = resolver.Resolve<TrackedLoggable>();
+            ILoggable decorated = resolver.Resolve<ILoggable>();
+
+            Assert.IsInstanceOf<TrackedLoggableDecorator>(decorated, "The decorated service type returns its decorator");
+            Assert.AreSame(undecorated, ((TrackedLoggableDecorator)decorated).Inner,
+                "The Singleton decorator wraps the same instance the undecorated alias resolves");
+        }
     }
 }

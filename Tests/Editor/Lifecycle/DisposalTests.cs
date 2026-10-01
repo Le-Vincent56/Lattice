@@ -114,5 +114,26 @@ namespace Didionysymus.Lattice.Tests.Editor.Lifecycle
 
             Assert.IsTrue(captured.IsDisposed, "Transient should be disposed");
         }
+
+        /// <summary>
+        /// A decorated Scoped service is two objects, the implementation and its decorator; disposing the scope
+        /// disposes both, not only the outermost one.
+        /// </summary>
+        [Test]
+        public void Dispose_WhenDecoratedScopedDisposed_InnerAndWrapperBothDisposed()
+        {
+            IObjectResolver resolver = Container.Build(b =>
+            {
+                b.Register<ILoggable, TrackedLoggable>(Lifetime.Scoped);
+                b.RegisterDecorator<ILoggable, TrackedLoggableDecorator>(Lifetime.Scoped);
+            });
+            TrackedLoggableDecorator decorator = (TrackedLoggableDecorator)resolver.Resolve<ILoggable>();
+            TrackedLoggable inner = (TrackedLoggable)decorator.Inner;
+
+            resolver.Dispose();
+
+            Assert.IsTrue(decorator.IsDisposed, "The decorator is disposed with its scope");
+            Assert.IsTrue(inner.IsDisposed, "The decorated inner instance is disposed with its scope too");
+        }
     }
 }

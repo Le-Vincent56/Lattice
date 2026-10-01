@@ -21,12 +21,15 @@ namespace Didionysymus.Lattice.Tests.Editor.Lifecycle
     public sealed class AsyncStartableTests
     {
         /// <summary>
-        /// Resets the shared <see cref="AsyncStartLogger.Order"/>
-        /// list between tests. The list is static so without this reset, entries leak
-        /// across test runs.
+        /// Resets the shared <see cref="AsyncStartLogger.Order"/> list and <see cref="ValueEqualStartable.StartCount"/>
+        /// between tests. Both are static, so without this reset, entries leak across test runs.
         /// </summary>
         [SetUp]
-        public void Reset() => AsyncStartLogger.Order.Clear();
+        public void Reset()
+        {
+            AsyncStartLogger.Order.Clear();
+            ValueEqualStartable.StartCount = 0;
+        }
 
         /// <summary>
         /// Multiple <see cref="IAsyncStartable"/> registrations must run sequentially; each one's
@@ -57,6 +60,24 @@ namespace Didionysymus.Lattice.Tests.Editor.Lifecycle
                     "C:enter", "C:exit"
                 })
             );
+        }
+
+        /// <summary>
+        /// Two registrations whose instances are equal by <c>Equals</c> are still two objects, and each is started.
+        /// Guards the once-per-call rule against comparing participants by value instead of by reference.
+        /// </summary>
+        [Test]
+        public async Task RunAsyncStartablesAsync_WhenDistinctStartablesAreEqual_StartsBoth()
+        {
+            using IObjectResolver resolver = Container.Build(b =>
+            {
+                b.RegisterFactory<IAsyncStartable>(_ => new ValueEqualStartable(), Lifetime.Singleton);
+                b.RegisterFactory<IAsyncStartable>(_ => new ValueEqualStartable(), Lifetime.Singleton);
+            });
+
+            await resolver.RunAsyncStartablesAsync(CancellationToken.None);
+
+            Assert.AreEqual(2, ValueEqualStartable.StartCount, "Distinct instances are started even when they compare equal");
         }
     }
 }

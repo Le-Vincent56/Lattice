@@ -18,8 +18,14 @@ namespace Didionysymus.Lattice.Runtime.Internal
         private readonly Scope _parent;
         private readonly Registry _registry;
 
-        // Per-scope cache of materialized Scope lifetime instances, keyed by entry identity.
+                // Per-scope cache of Scoped implementation instances, keyed by the registration's primary entry so every
+        // alias of one registration shares one instance.
         private readonly Dictionary<RegistrationEntry, object> _scopedCache =
+            new Dictionary<RegistrationEntry, object>();
+
+        // Per-scope cache of decorated Scoped results, keyed by the alias entry: each alias wraps the shared instance
+        // in the decorator chain of its own service type.
+        private readonly Dictionary<RegistrationEntry, object> _scopedDecoratedCache =
             new Dictionary<RegistrationEntry, object>();
 
         // All IDisposables created within this scope, in creation order. Disposed in reverse on Dispose().
@@ -33,9 +39,10 @@ namespace Didionysymus.Lattice.Runtime.Internal
         private readonly object _lock = new object();
         private bool _disposed;
 
-        // Singleton cache lives only on the root scope. Child scopes route
-        // Singleton lookups via Root.
+        // Singleton caches live only on the root scope; child scopes route Singleton lookups via Root. The first holds
+        // implementation instances keyed by primary entry, the second decorated results keyed by alias entry.
         private readonly Dictionary<RegistrationEntry, object> _singletonCache;
+        private readonly Dictionary<RegistrationEntry, object> _singletonDecoratedCache;
 
         // Tracks which IInitializable instances have already had Initialize() called.
         // Ensures Initialize runs at-most-once per instance, even across repeated
@@ -82,9 +89,12 @@ namespace Didionysymus.Lattice.Runtime.Internal
             _registry = registry;
             _parent = parent;
 
-            // Only the root has a singleton cache; child scopes route Singleton
+            // Only the root has Singleton caches; child scopes route Singleton
             // lookups via Root
             _singletonCache = parent == null
+                ? new Dictionary<RegistrationEntry, object>()
+                : null;
+            _singletonDecoratedCache = parent == null
                 ? new Dictionary<RegistrationEntry, object>()
                 : null;
 
@@ -367,15 +377,12 @@ namespace Didionysymus.Lattice.Runtime.Internal
                         Scope rootScope = Root;
                         lock (rootScope._lock)
                         {
-                            if (rootScope._singletonCache.TryGetValue(entry, out object cached))
-                                return cached;
-
-                            object created = WrapDecorators(entry, () => entry.Activator(this));
-                            rootScope._singletonCache[entry] = created;
-
-                            if (created is IDisposable disposable) rootScope._disposables.Add(disposable);
-
-                            return created;
+                            return GetOrCreateCached(
+                                entry,
+                                rootScope._singletonCache,
+                                rootScope._singletonDecoratedCache,
+                                rootScope._disposables
+                            );
                         }
                     }
 
@@ -389,21 +396,13 @@ namespace Didionysymus.Lattice.Runtime.Internal
                         // locks during activation are only ever this scope's or an ancestor's.
                         lock (_lock)
                         {
-                            if (_scopedCache.TryGetValue(entry, out object cached))
-                                return cached;
-
-                            object created = WrapDecorators(entry, () => entry.Activator(this));
-                            _scopedCache[entry] = created;
-
-                            if (created is IDisposable disposable) _disposables.Add(disposable);
-
-                            return created;
+                            return GetOrCreateCached(entry, _scopedCache, _scopedDecoratedCache, _disposables);
                         }
                     }
 
                     case Lifetime.Transient:
                     {
-                        object created = WrapDecorators(entry, () => entry.Activator(requestingScope));
+                        object created = WrapDecorators(entry, entry.Activator(requestingScope));
 
                         // Per planning decision: only IDisposable transients are tracked,
                         // attributed to the scope that requested them
@@ -464,17 +463,15 @@ namespace Didionysymus.Lattice.Runtime.Internal
         }
 
         /// <summary>
-        /// Applies registered decorators to the provided service instance, using the decorator chain
-        /// associated with the service type in the registry. If no decorators are registered for the service
-        /// type, the original instance is returned.
+        /// Applies the decorator chain registered in this scope for <paramref name="entry"/>'s service type to
+        /// <paramref name="inner"/>, first registered innermost. Returns <paramref name="inner"/> itself when the
+        /// service type has no decorators here.
         /// </summary>
-        /// <param name="entry">The registration entry specifying the service type and details for the instance being decorated.</param>
-        /// <param name="buildInner">A delegate that creates the initial service instance before applying decorators.</param>
-        /// <returns>The service instance wrapped with all applicable decorators, or the original instance if no decorators are registered.</returns>
-        private object WrapDecorators(RegistrationEntry entry, Func<object> buildInner)
+        /// <param name="entry">The entry being resolved; its service type selects the decorator chain.</param>
+        /// <param name="inner">The built implementation instance to wrap.</param>
+        /// <returns>The outermost decorator, or <paramref name="inner"/> when no decorators are registered.</returns>
+        private object WrapDecorators(RegistrationEntry entry, object inner)
         {
-            object inner = buildInner.Invoke();
-
             // Decorators apply only at the scope where they were registered
             if (!_registry.DecoratorChains.TryGetValue(entry.ServiceType, out List<DecoratorEntry> decorators)
                 || decorators.Count == 0
@@ -515,6 +512,51 @@ namespace Didionysymus.Lattice.Runtime.Internal
             return constructor.Invoke(args);
         }
 
+        /// <summary>
+        /// Returns the cached result for <paramref name="entry"/>, building what is missing. The registration's
+        /// implementation instance is built by and cached once under <see cref="RegistrationEntry.Primary"/>, so every
+        /// alias shares it whichever alias is resolved first; an alias whose service type has a decorator chain in
+        /// this scope gets that chain built once around the shared instance and cached under the alias entry. Each
+        /// object is tracked for disposal when created, the shared instance before any wrapper, so reverse-order
+        /// disposal releases a wrapper before its inner object. The caller holds the lock of the scope that owns the
+        /// caches.
+        /// </summary>
+        /// <param name="entry">The alias entry being resolved; it belongs to this scope's registry.</param>
+        /// <param name="instanceCache">The implementation cache, keyed by primary entry.</param>
+        /// <param name="decoratedCache">The decorated-result cache, keyed by alias entry.</param>
+        /// <param name="disposables">The disposal list of the scope that owns both caches.</param>
+        /// <returns>
+        /// The decorated result for <paramref name="entry"/>, or the shared instance when its service type has no
+        /// decorators.
+        /// </returns>
+        private object GetOrCreateCached(
+            RegistrationEntry entry,
+            Dictionary<RegistrationEntry, object> instanceCache,
+            Dictionary<RegistrationEntry, object> decoratedCache,
+            List<IDisposable> disposables
+        )
+        {
+            if (decoratedCache.TryGetValue(entry, out object decorated)) return decorated;
+
+            RegistrationEntry primary = entry.Primary;
+            if (!instanceCache.TryGetValue(primary, out object instance))
+            {
+                instance = primary.Activator(this);
+                instanceCache[primary] = instance;
+
+                if (instance is IDisposable disposable) disposables.Add(disposable);
+            }
+
+            object wrapped = WrapDecorators(entry, instance);
+            if (ReferenceEquals(wrapped, instance)) return instance;
+
+            decoratedCache[entry] = wrapped;
+
+            if (wrapped is IDisposable wrappedDisposable) disposables.Add(wrappedDisposable);
+
+            return wrapped;
+        }
+        
         /// <summary>
         /// Gathers all registration entries associated with the specified service type from the current scope
         /// and its parent scopes, if any, into a collection.
@@ -563,9 +605,9 @@ namespace Didionysymus.Lattice.Runtime.Internal
         }
 
         /// <summary>
-        /// Runs <see cref="IInitializable.Initialize"/> on every <see cref="IInitializable"/>
-        /// instance currently materialized in this scope's cache plus the root-scope singleton cache.
-        /// Idempotent; each instance is initialized at most once across repeated calls.
+        /// Runs <see cref="IInitializable.Initialize"/> on every <see cref="IInitializable"/> instance currently held
+        /// in this scope's caches (implementation instances and decorated results) and, on the root, in the Singleton
+        /// caches. Idempotent; each instance is initialized at most once across repeated calls.
         /// </summary>
         /// <remarks>
         /// As per the Phase 1 / Phase 2 ordering: by the time this is called, all bindings
@@ -573,7 +615,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
         /// can therefore safely observe peer instances' bound state.
         ///
         /// Transient instances are not tracked in either cache and therefore not visited here;
-        /// register an IInitializable as Scoped or Singleton if y ou need its Initialize hook.
+        /// register an IInitializable as Scoped or Singleton if you need its Initialize hook.
         /// </remarks>
         internal void RunInitializables()
         {
@@ -583,24 +625,14 @@ namespace Didionysymus.Lattice.Runtime.Internal
             // separate from user code that might (in principle) cause re-entrancy
             List<object> targets = new List<object>();
 
-            foreach (KeyValuePair<RegistrationEntry, object> pair in _scopedCache)
-            {
-                if (pair.Value is not IInitializable || !_initialized.Add(pair.Value))
-                    continue;
+            CollectInitializables(_scopedCache, targets);
+            CollectInitializables(_scopedDecoratedCache, targets);
 
-                targets.Add(pair.Value);
-            }
-
-            // Singleton cache is only present on the root scope; harmless to check elsewhere
+            // Singleton caches are only present on the root scope; harmless to check elsewhere
             if (_singletonCache != null)
             {
-                foreach (KeyValuePair<RegistrationEntry, object> pair in _singletonCache)
-                {
-                    if (pair.Value is not IInitializable || !_initialized.Add(pair.Value))
-                        continue;
-
-                    targets.Add(pair.Value);
-                }
+                CollectInitializables(_singletonCache, targets);
+                CollectInitializables(_singletonDecoratedCache, targets);
             }
 
             for (int i = 0; i < targets.Count; i++)
@@ -610,14 +642,36 @@ namespace Didionysymus.Lattice.Runtime.Internal
         }
 
         /// <summary>
+        /// Adds every <see cref="IInitializable"/> value of <paramref name="cache"/> that has not been initialized yet
+        /// to <paramref name="targets"/>, recording it in <c>_initialized</c> so it is initialized at most once.
+        /// </summary>
+        /// <param name="cache">An implementation or decorated-result cache of this scope.</param>
+        /// <param name="targets">The instances to initialize, in collection order.</param>
+        private void CollectInitializables(Dictionary<RegistrationEntry, object> cache, List<object> targets)
+        {
+            foreach (KeyValuePair<RegistrationEntry, object> pair in cache)
+            {
+                if (pair.Value is not IInitializable || !_initialized.Add(pair.Value))
+                    continue;
+
+                targets.Add(pair.Value);
+            }
+        }
+
+        /// <summary>
         /// Walks this scope's registry in registration order, materializes any
         /// <see cref="IAsyncStartable"/> registrations, and awaits <c>StartAsync</c> on each
-        /// sequentially. Each startable's await must complete before the next begins.
+        /// sequentially. Each startable's await must complete before the next begins, and an instance reached through
+        /// more than one startable service type is started once per call; instances are compared by reference.
         /// </summary>
         /// <param name="cancellationToken">Cancellation propagated to each StartAsync call.</param>
         internal async Task RunAsyncStartablesAsync(CancellationToken cancellationToken)
         {
             ThrowIfDisposed();
+
+            // A registration aliased under two startable service types is one instance in two buckets; start it once.
+            // Compare by reference so two distinct instances that are equal by Equals both start.
+            HashSet<object> started = new HashSet<object>(ReferenceIdentityComparer.Instance);
 
             foreach (KeyValuePair<Type, List<RegistrationEntry>> kvp in _registry.ClosedRegistry)
             {
@@ -628,7 +682,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
                 {
                     object instance = MaterializeFromEntry(kvp.Value[i], this);
 
-                    if (instance is not IAsyncStartable startable) continue;
+                    if (instance is not IAsyncStartable startable || !started.Add(instance)) continue;
 
                     await startable.StartAsync(cancellationToken).ConfigureAwait(false);
                 }
@@ -699,6 +753,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
             _disposables.Clear();
             _scopedCache.Clear();
+            _scopedDecoratedCache.Clear();
         }
 
         /// <summary>
