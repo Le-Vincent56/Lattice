@@ -124,4 +124,23 @@ namespace Didionysymus.Lattice.Tests.Editor.Fixtures
         public IReadOnlyList<IPipelineStage> Stages { get; }
         public PipelineConsumer(IReadOnlyList<IPipelineStage> stages) => Stages = stages;
     }
+
+    /// <summary>
+    /// Second concrete <see cref="IServiceA"/>. Registered in a child scope to shadow <see cref="ServiceA"/>,
+    /// so a test can tell from the runtime type which scope's registration a dependency came from.
+    /// </summary>
+    public sealed class AlternateServiceA : IServiceA
+    {
+        public Guid InstanceID { get; } = Guid.NewGuid();
+    }
+
+    /// <summary>
+    /// Service that constructor-injects a <see cref="DisposableService"/> and exposes it, so a test can check
+    /// whether that dependency was disposed by the scope that owns this instance or by the scope that requested it.
+    /// </summary>
+    public sealed class DisposableDependent
+    {
+        public DisposableService Dependency { get; }
+        public DisposableDependent(DisposableService dependency) => Dependency = dependency;
+    }
 }

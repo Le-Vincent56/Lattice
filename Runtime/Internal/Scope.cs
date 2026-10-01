@@ -144,20 +144,35 @@ namespace Didionysymus.Lattice.Runtime.Internal
             return result;
         }
 
+        /// <summary>
+        /// Creates a child scope whose registrations shadow this scope's for resolves that start in the child.
+        /// The child is validated before it exists: Singleton registrations are rejected, and the child's graph
+        /// is walked against this scope and every ancestor so cycles surface here rather than at first resolve.
+        /// </summary>
+        /// <param name="configure">Registers the child's services on a fresh builder.</param>
+        /// <returns>The new child scope.</returns>
+        /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed.</exception>
+        /// <exception cref="ChildSingletonRegistrationException">Thrown when the child registers a service with <see cref="Lifetime.Singleton"/> other than through <c>RegisterInstance</c>.</exception>
+        /// <exception cref="CyclicDependencyException">Thrown when the child's registrations form a cycle, alone or through this scope's and its ancestors' registrations.</exception>
         public IObjectResolver CreateChildScope(Action<IContainerBuilder> configure)
         {
             ThrowIfDisposed();
             ContainerBuilder childBuilder = new ContainerBuilder();
             configure.Invoke(childBuilder);
 
-            // Promote PreserveClosedGenerics declarations into the child's closed registry before validation.
-            // Pass the parent chain so child-scope preserved-close-generics can resolve against an open
-            // registration declared on a parent
+            // Promote PreserveClosedGenerics declarations into the child's closed registry first, so a closed
+            // generic preserved against an open registration declared on this scope or an ancestor is both
+            // validated and checked for lifetime below.
             childBuilder.Registry.PrebuildPreservedClosedGenerics(parentChain: ParentRegistriesIncludingSelf());
 
-            // Validate the child's registrations against the full parent chain so captive-dependency
-            // and cycle errors surface at scope creation, not at first resolve.
-            DependencyGraphValidator.Validate(childBuilder.Registry, parentChain: ParentRegistries());
+            // A Singleton in a child would be cached by the root and outlive the child. Reject it before the
+            // graph walk so the error names the registration.
+            ThrowIfChildRegistersSingleton(childBuilder.Registry);
+
+            // Validate the child's registrations against this scope and every ancestor, nearest first. This is the
+            // same chain Resolve walks, so a cycle that crosses into this scope, and a registration this scope
+            // shadows, are judged exactly as resolution would see them, and surface here rather than at first resolve.
+            DependencyGraphValidator.Validate(childBuilder.Registry, parentChain: ParentRegistriesIncludingSelf());
 
             return new Scope(childBuilder.Registry, this);
         }
@@ -314,7 +329,10 @@ namespace Didionysymus.Lattice.Runtime.Internal
         /// Handles activation, lifecycle management, and runtime cycle detection for the service.
         /// </summary>
         /// <param name="entry">The registration entry containing details about the service implementation, lifetime, and pre-built instance, if applicable.</param>
-        /// <param name="requestingScope">The scope within which the service is being resolved. Used for lifecycle tracking and dependency resolution context.</param>
+        /// <param name="requestingScope">
+        /// The scope the public resolve was called on. Transient instances are built with it and, when disposable, tracked by it; Scoped and Singleton
+        /// instances are built with and tracked by the scope that caches them.
+        /// </param>
         /// <returns>An instance of the service described by the registration entry.</returns>
         /// <exception cref="CyclicDependencyException">Thrown when a cyclic dependency is detected while resolving the service instance.</exception>
         /// <exception cref="InvalidOperationException">Thrown when the service has an unknown or unsupported lifetime configuration.</exception>
@@ -363,20 +381,21 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
                     case Lifetime.Scoped:
                     {
-                        // The scope that "owns" a Scoped instance is where the registration lives.
-                        // Walk up from "requestingScope" to find the first scope whose
-                        // registry contains this entry. This makes child resolves of a parent-registered
-                        // Scoped service share a single instance per the parent scope.
-                        Scope owning = FindOwningScope(entry, requestingScope);
-                        lock (owning._lock)
+                        // This scope's registry holds the entry, so this scope owns the instance: it caches it,
+                        // builds it with its own resolution context, and disposes it. Activating with "this"
+                        // rather than the requesting scope keeps a child registration from being captured by an
+                        // instance the whole subtree shares, attributes any IDisposable Transients created
+                        // during the activation to this scope so they outlive every child, and means nested
+                        // locks during activation are only ever this scope's or an ancestor's.
+                        lock (_lock)
                         {
-                            if (owning._scopedCache.TryGetValue(entry, out object cached))
+                            if (_scopedCache.TryGetValue(entry, out object cached))
                                 return cached;
 
-                            object created = WrapDecorators(entry, () => entry.Activator(requestingScope));
-                            owning._scopedCache[entry] = created;
+                            object created = WrapDecorators(entry, () => entry.Activator(this));
+                            _scopedCache[entry] = created;
 
-                            if (created is IDisposable disposable) owning._disposables.Add(disposable);
+                            if (created is IDisposable disposable) _disposables.Add(disposable);
 
                             return created;
                         }
@@ -497,28 +516,6 @@ namespace Didionysymus.Lattice.Runtime.Internal
         }
 
         /// <summary>
-        /// Identifies the scope that "owns" a specific registration entry by traversing the parent chain
-        /// from the provided starting scope. This ensures that Scoped services use the instance tied
-        /// to the owning scope where the registration was originally defined.
-        /// </summary>
-        /// <param name="entry">The registration entry for which the owning scope is sought.</param>
-        /// <param name="start">The scope from which to begin the search for the owning scope.</param>
-        /// <returns>The scope that owns the provided registration entry. If no such scope is found, the starting scope is returned.</returns>
-        private Scope FindOwningScope(RegistrationEntry entry, Scope start)
-        {
-            for (Scope s = start; s != null; s = s._parent)
-            {
-                if (!s._registry.ClosedRegistry.TryGetValue(entry.ServiceType, out List<RegistrationEntry> list) ||
-                    !list.Contains(entry))
-                    continue;
-
-                return s;
-            }
-
-            return start;
-        }
-
-        /// <summary>
         /// Gathers all registration entries associated with the specified service type from the current scope
         /// and its parent scopes, if any, into a collection.
         /// </summary>
@@ -551,30 +548,11 @@ namespace Didionysymus.Lattice.Runtime.Internal
         }
 
         /// <summary>
-        /// Retrieves an enumeration of registries from the current scope's parent chain.
-        /// Each registry represents the collection of service registrations and decorator chains
-        /// for a specific scope in the hierarchy, starting from the immediate parent and moving up.
+        /// Yields this scope's registry, then each ancestor's up to the root. This is the chain a child's
+        /// preserved closed generics are prebuilt against and the chain the child's registrations are validated
+        /// against, so both see the same registrations resolution from the child would see.
         /// </summary>
-        /// <returns>An enumerable collection of <see cref="Registry"/> objects from the parent scopes,
-        /// ordered from the immediate parent to the root scope.</returns>
-        internal IEnumerable<Registry> ParentRegistries()
-        {
-            for (Scope s = _parent; s != null; s = s._parent)
-            {
-                yield return s._registry;
-            }
-        }
-
-        /// <summary>
-        /// Like <see cref="ParentRegistries"/>, but yields this scope's own registry first.
-        /// Used by <see cref="CreateChildScope"/> when invoking <see cref="Registry.PrebuildPreservedClosedGenerics"/>
-        /// on a child builder, so the child's preserved closed generics can resolve against an open registration declared on the
-        /// immediate parent (i.e., this scope).
-        /// </summary>
-        /// <returns>
-        /// An enumerable sequence of <see cref="Registry"/> instances starting with the current scope and traversing
-        /// up the parent scope chain.
-        /// </returns>
+        /// <returns>The registries from this scope up to the root, nearest first.</returns>
         internal IEnumerable<Registry> ParentRegistriesIncludingSelf()
         {
             yield return _registry;
@@ -733,8 +711,33 @@ namespace Didionysymus.Lattice.Runtime.Internal
         private void ThrowIfDisposed()
         {
             if (!_disposed) return;
-
+            
             throw new ObjectDisposedException(nameof(Scope));
+        }
+        
+        /// <summary>
+        /// Rejects Singleton registrations in a child registry. The root caches and disposes every Singleton, so
+        /// one registered in a child would be built from the child's registrations, outlive the child, and be
+        /// rebuilt for every creation of that child. Pre-built instances are allowed: nothing builds or disposes them.
+        /// </summary>
+        /// <param name="childRegistry">The registry of the child about to be created, after preserved closed generics were prebuilt into it.</param>
+        /// <exception cref="ChildSingletonRegistrationException">Thrown for the first closed or open Singleton registration found.</exception>
+        private static void ThrowIfChildRegistersSingleton(Registry childRegistry)
+        {
+            for (int i = 0; i < childRegistry.RegistrationOrder.Count; i++)
+            {
+                RegistrationEntry entry = childRegistry.RegistrationOrder[i];
+                if (entry.Lifetime != Lifetime.Singleton || entry.IsPreBuiltInstance) continue;
+
+                throw new ChildSingletonRegistrationException(entry.ServiceType, entry.ImplType);
+            }
+
+            foreach (KeyValuePair<Type, OpenGenericEntry> pair in childRegistry.OpenRegistry)
+            {
+                if (pair.Value.Lifetime != Lifetime.Singleton) continue;
+
+                throw new ChildSingletonRegistrationException(pair.Key, pair.Value.OpenImplType);
+            }
         }
     }
 }

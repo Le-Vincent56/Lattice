@@ -30,12 +30,15 @@ namespace Didionysymus.Lattice.Runtime
         IReadOnlyList<T> ResolveAll<T>();
 
         /// <summary>
-        /// Creates a new child scope within the dependency injection container, allowing
-        /// additional configurations to be applied specifically to the child scope.
+        /// Creates a child scope. The child inherits this scope's registrations, and its own registrations shadow
+        /// them for resolves that start in the child. A child may register Scoped and Transient services and
+        /// supply instances; it may not register Singletons, which belong to the root.
         /// </summary>
-        /// <param name="configure">An action to configure the child scope by adding registrations
-        /// or services through the provided container builder.</param>
-        /// <returns>An instance of <see cref="IObjectResolver"/> representing the created child scope.</returns>
+        /// <param name="configure">Registers the child's services on a fresh <see cref="IContainerBuilder"/>.</param>
+        /// <returns>The new child scope. Dispose it to release what it owns; disposing this scope disposes it too.</returns>
+        /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed.</exception>
+        /// <exception cref="Exceptions.ChildSingletonRegistrationException">Thrown when the child registers a service with <see cref="Lifetime.Singleton"/> other than through <see cref="IContainerBuilder.RegisterInstance{TService}"/>.</exception>
+        /// <exception cref="Exceptions.CyclicDependencyException">Thrown when the child's registrations form a cycle, alone or through this scope's and its ancestors' registrations.</exception>
         IObjectResolver CreateChildScope(Action<IContainerBuilder> configure);
 
         /// <summary>

@@ -69,5 +69,28 @@ namespace Didionysymus.Lattice.Tests.Editor.Resolution
 
             Assert.AreSame(resolved, pinned, "RegisterInstance should return the exact reference provided");
         }
+
+        /// <summary>
+        /// A root Singleton is built with the root's resolution context, so a child registration of one of its
+        /// dependencies does not reach it, even when the child is the first requester.
+        /// </summary>
+        [Test]
+        public void Resolve_WhenChildOverridesDependencyOfRootSingleton_SingletonUsesRootDependency()
+        {
+            using IObjectResolver root = Container.Build(b =>
+            {
+                b.Register<IServiceA, ServiceA>(Lifetime.Transient);
+                b.Register<IServiceB, ServiceB>(Lifetime.Singleton);
+            });
+            using IObjectResolver child = root.CreateChildScope(b =>
+            {
+                b.Register<IServiceA, AlternateServiceA>(Lifetime.Transient);
+            });
+
+            IServiceB fromChild = child.Resolve<IServiceB>();
+
+            Assert.IsInstanceOf<ServiceA>(fromChild.A,
+                "A root Singleton is built from the root's registrations, not the requesting child's");
+        }
     }
 }

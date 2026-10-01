@@ -72,15 +72,21 @@ resolver.Dispose();
 
 ## Lifetimes
 
-| Lifetime | Cached where | Disposed when |
-|---|---|---|
-| `Transient` | nowhere; new each resolve | when the resolving scope is disposed (only if `IDisposable`) |
-| `Scoped` | the resolving scope | when that scope is disposed |
-| `Singleton` | the root scope | when the root scope is disposed |
+| Lifetime | Cached where | Constructed with | Disposed when (`IDisposable` only) |
+|---|---|---|---|
+| `Transient` | nowhere; new each resolve | the requesting scope | when the requesting scope is disposed |
+| `Scoped` | the scope whose registration it is (the owning scope) | the owning scope | when the owning scope is disposed |
+| `Singleton` | the root scope; registrable only at the root | the root scope | when the root scope is disposed |
 
-**Captive dependency rule** (enforced at registration time): a `Singleton` may only
-depend on `Singleton`. A `Scoped` may depend on `Singleton` or `Scoped`. A `Transient`
-may depend on anything. Violations throw `CaptiveDependencyException` with the full chain.
+A cached instance is built by the scope that caches it: its dependencies come from that scope's view of the
+registry, and the `IDisposable` Transients created while building it belong to that scope. A child registration
+never changes what a parent-owned instance is made of; it only shadows for resolves that start in the child. A
+dependency that only a child registers does not satisfy a parent-owned service; resolving that service throws
+`RegistrationNotFoundException`.
+
+**Captive dependency rule** (enforced at `Build`): a `Singleton` may not depend on a `Scoped`, directly or through
+any chain of `Transient`s. Everything else is allowed. Violations throw `CaptiveDependencyException` with the full
+chain.
 
 ## Scopes
 
@@ -91,9 +97,15 @@ IObjectResolver child = resolver.CreateChildScope(builder =>
 });
 ```
 
-Child scopes inherit parent registrations; a child registration shadows the parent's.
-Disposing a child does not dispose the parent; disposing the root cascades to all
-undisposed children. Disposables are released in reverse creation order.
+Child scopes inherit parent registrations; a child registration shadows the parent's for `Resolve` (`ResolveAll`
+returns parent and child registrations together, root first). A Scoped registration in a parent is one instance
+for the parent and every descendant; a Scoped registration in a child is one instance per child, so siblings each
+get their own. A child may not register a `Singleton`: `CreateChildScope` throws
+`ChildSingletonRegistrationException`. Use `Lifetime.Scoped` for one instance per child; `RegisterInstance` is
+allowed in any scope. `CreateChildScope` validates the child against the creating scope and every ancestor, so a
+cycle that crosses the boundary is reported at creation. Disposing a child disposes only what the child owns and
+does not affect the parent; disposing the root cascades to all undisposed children. Disposables are released in
+reverse creation order.
 
 ## Multi-binding
 
@@ -245,7 +257,8 @@ In the Editor: menu Lattice > Dump Active Scope Tree (Play mode only).
 All resolution failures derive from `Didionysymus.Lattice.Runtime.Exceptions.DependencyResolutionException`:
 `RegistrationNotFoundException`, `CyclicDependencyException`, `CaptiveDependencyException`,
 `MultipleConstructorsException`, `MultipleInjectMethodsException`. Every message includes the
-full requested-type chain.
+full requested-type chain. A seventh, `ChildSingletonRegistrationException`, is thrown by `CreateChildScope` when a
+child registers a Singleton; carries `ServiceType` and `ImplType`.
 
 ## Constructor selection
 

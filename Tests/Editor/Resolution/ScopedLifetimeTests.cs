@@ -1,18 +1,17 @@
 using Didionysymus.Lattice.Runtime;
+using Didionysymus.Lattice.Runtime.Exceptions;
 using Didionysymus.Lattice.Tests.Editor.Fixtures;
 using NUnit.Framework;
 
 namespace Didionysymus.Lattice.Tests.Editor.Resolution
 {
     /// <summary>
-    /// Verifies Scoped lifetime semantics: one instance per "owning scope". The owning scope
-    /// is the scope where the registration lives; Scoped services registered in the root are
-    /// shared across all descendants; Scoped services registered locally in a child are unique
-    /// to that child.
+    /// Verifies Scoped lifetime semantics: one instance per owning scope, where the owning scope is the scope
+    /// whose registry holds the registration. A Scoped registration in the root is shared by every descendant and
+    /// built with the root's resolution context; a Scoped registration local to a child is unique to that child.
     ///
-    /// Exercises <c>Scope.MaterializeFromEntry</c>'s Scoped branch and the
-    /// <c>Scope.FindOwningScope</c> walk that determines which scope's <c>_scopedCache</c>
-    /// holds the instance.
+    /// Exercises the Scoped branch of <c>Scope.MaterializeFromEntry</c>, which caches on, activates with, and
+    /// tracks disposables in the scope the entry belongs to.
     /// </summary>
     [TestFixture]
     public sealed class ScopedLifetimeTests
@@ -36,12 +35,11 @@ namespace Didionysymus.Lattice.Tests.Editor.Resolution
         }
 
         /// <summary>
-        /// When the Scoped registration lives in the root, all descendant scopes share
-        /// the same instance; the root is the "owning scope" for that registration.
-        /// Verifies <c>FindOwningScope</c> walks up and lands on root.
+        /// When the Scoped registration lives in the parent, every descendant shares the parent's instance:
+        /// the parent is the owning scope, so two sibling children resolve the same object.
         /// </summary>
         [Test]
-        public void Resolve_WhenLifetimeIsScoped_ReturnsDifferentInstancesAcrossSiblingChildScopes()
+        public void Resolve_WhenScopedRegisteredInParent_ReturnsSameInstanceAcrossSiblingChildScopes()
         {
             using IObjectResolver root = Container.Build(b => { b.Register<IServiceA, ServiceA>(Lifetime.Scoped); });
             using IObjectResolver siblingA = root.CreateChildScope(_ => { });
@@ -50,18 +48,14 @@ namespace Didionysymus.Lattice.Tests.Editor.Resolution
             IServiceA fromA = siblingA.Resolve<IServiceA>();
             IServiceA fromB = siblingB.Resolve<IServiceA>();
 
-            // Both children walk up to root for the registration;
-            // root is the owning scope, so siblings share the SAME instance. Despite
-            // the test name suggesting "different", the plan's intended assertion is sameness; the
-            // registration's owning scope wins
             Assert.AreSame(fromA, fromB,
-                "Scoped registration in root is owned by root, so all descendants share that instance");
+                "A Scoped registration in the parent is owned by the parent, so siblings share its instance");
         }
 
         /// <summary>
         /// When the Scoped registration is local to a child scope, that child is the owning scope.
-        /// Sibling children with their own local registration get independent instances. Verifies
-        /// that <c>FindOwningScope</c> stops at the child rather than continuing up to root.
+        /// Sibling children with their own local registration get independent instances, each cached by the
+        /// child whose registry holds the entry rather than by the root.
         /// </summary>
         [Test]
         public void Resolve_WhenScopedRegistrationIsLocalToChild_DifferentSiblingsHaveDifferentInstances()
@@ -81,6 +75,74 @@ namespace Didionysymus.Lattice.Tests.Editor.Resolution
                 "Sibling A should have the same instance as sibling B, despite being different scopes");
             Assert.AreSame(siblingB.Resolve<IServiceA>(), fromB,
                 "Sibling B should have the same instance as sibling A, despite being different scopes");
+        }
+
+        /// <summary>
+        /// A Scoped service registered in the parent is built with the parent's resolution context, so a child
+        /// registration of one of its dependencies does not reach it, even when the child is the first requester.
+        /// </summary>
+        [Test]
+        public void Resolve_WhenChildOverridesDependencyOfParentOwnedScoped_ParentInstanceUsesParentDependency()
+        {
+            using IObjectResolver root = Container.Build(b =>
+            {
+                b.Register<IServiceA, ServiceA>(Lifetime.Transient);
+                b.Register<IServiceB, ServiceB>(Lifetime.Scoped);
+            });
+            using IObjectResolver child = root.CreateChildScope(b =>
+            {
+                b.Register<IServiceA, AlternateServiceA>(Lifetime.Transient);
+            });
+
+            IServiceB fromChild = child.Resolve<IServiceB>();
+            IServiceB fromRoot = root.Resolve<IServiceB>();
+
+            Assert.IsInstanceOf<ServiceA>(fromChild.A,
+                "A parent-owned Scoped service is built from the parent's registrations, not the child's");
+            Assert.AreSame(fromChild, fromRoot, "The parent-owned instance is the one the parent resolves too");
+        }
+
+        /// <summary>
+        /// A Scoped factory registered in the parent receives the parent as its resolver, so a child registration
+        /// of a type the factory resolves does not reach it.
+        /// </summary>
+        [Test]
+        public void Resolve_WhenParentOwnedScopedFactoryResolvedFromChild_FactoryResolvesThroughOwningScope()
+        {
+            using IObjectResolver root = Container.Build(b =>
+            {
+                b.Register<IServiceA, ServiceA>(Lifetime.Transient);
+                b.RegisterFactory<IServiceB>(r => new ServiceB(r.Resolve<IServiceA>()), Lifetime.Scoped);
+            });
+            using IObjectResolver child = root.CreateChildScope(b =>
+            {
+                b.Register<IServiceA, AlternateServiceA>(Lifetime.Transient);
+            });
+
+            IServiceB fromChild = child.Resolve<IServiceB>();
+
+            Assert.IsInstanceOf<ServiceA>(fromChild.A,
+                "A parent-owned Scoped factory resolves through the parent, not through the requesting child");
+        }
+
+        /// <summary>
+        /// A parent-owned Scoped service is built from the parent's view of the registry, so a dependency that
+        /// only a child registers does not satisfy it: the resolve fails instead of capturing the child's registration.
+        /// </summary>
+        [Test]
+        public void Resolve_WhenParentOwnedScopedDependencyRegisteredOnlyInChild_ThrowsRegistrationNotFoundException()
+        {
+            using IObjectResolver root = Container.Build(b => { b.Register<IServiceB, ServiceB>(Lifetime.Scoped); });
+            using IObjectResolver child = root.CreateChildScope(b =>
+            {
+                b.Register<IServiceA, ServiceA>(Lifetime.Transient);
+            });
+
+            RegistrationNotFoundException ex =
+                Assert.Throws<RegistrationNotFoundException>(() => child.Resolve<IServiceB>());
+
+            Assert.AreEqual(typeof(IServiceA), ex.RequestedType,
+                "The parent cannot see the child's registration, so the missing dependency is the one it needs");
         }
     }
 }
