@@ -84,4 +84,55 @@ namespace Didionysymus.Lattice.Tests.Runtime.Fixtures
 
         public void Initialize() => ServiceWasReadyInInitialize = Service != null;
     }
+
+    /// <summary>
+    /// <see cref="IInitializable"/> MonoBehaviour that counts <see cref="Initialize"/> calls, so a test can tell zero
+    /// from once from twice.
+    /// </summary>
+    public sealed class CountingInitializableMonoBehaviour : MonoBehaviour, IInitializable
+    {
+        public int InitializeCount { get; private set; }
+        public void Initialize() => InitializeCount++;
+    }
+
+    /// <summary>
+    /// Service that reports whether its own <c>Initialize</c> has run, so a component can record the service's
+    /// state at the moment the component itself is initialized.
+    /// </summary>
+    public interface IInitializableProbe
+    {
+        bool IsInitialized { get; }
+    }
+
+    /// <summary>
+    /// Concrete <see cref="IInitializableProbe"/>; <see cref="Initialize"/> flips <see cref="IsInitialized"/>.
+    /// </summary>
+    public sealed class InitializableProbeService : IInitializableProbe, IInitializable
+    {
+        public bool IsInitialized { get; private set; }
+        public void Initialize() => IsInitialized = true;
+    }
+
+    /// <summary>
+    /// Component that depends on <see cref="IInitializableProbe"/> and records, inside its own <c>Initialize</c>,
+    /// whether the service had already been initialized.
+    /// </summary>
+    public sealed class ServiceObservingMonoBehaviour : MonoBehaviour, IInitializable
+    {
+        [Inject] public IInitializableProbe Probe;
+        public bool ProbeWasInitializedInInitialize { get; private set; }
+        public void Initialize() => ProbeWasInitializedInInitialize = Probe != null && Probe.IsInitialized;
+    }
+
+    /// <summary>
+    /// Host that registers <see cref="InitializableProbeService"/> as a Singleton, for the services-before-components
+    /// test.
+    /// </summary>
+    public sealed class TestProbeRootScope : LifetimeScopeBehaviour
+    {
+        protected override void Configure(IContainerBuilder builder)
+        {
+            builder.Register<IInitializableProbe, InitializableProbeService>(Lifetime.Singleton);
+        }
+    }
 }

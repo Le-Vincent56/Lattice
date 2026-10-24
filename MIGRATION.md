@@ -49,3 +49,36 @@ initialized by `RunInitializables`, and `RunAsyncStartablesAsync` starts an alia
 What to do: if code relied on two aliases being two objects, register the implementation twice with two `Register`
 calls instead of aliasing. If a decorator forwards `Initialize` or `Dispose` to the instance it wraps, stop
 forwarding: the container now makes both calls on the inner instance itself, so forwarding runs each one twice.
+
+### Lifecycle participants are built by the pass
+
+`RunInitializables` now materializes every Singleton or Scoped registration of its scope whose implementation or
+decorator type implements `IInitializable`, then initializes them in creation order. A participant nobody resolved
+is no longer skipped, and a participant whose dependency is unregistered now fails at the pass.
+
+What to do: nothing for services you resolved before the pass. If a registered `IInitializable` must not be
+constructed at startup, register it as Transient or drop the interface. A factory whose service type is not
+`IInitializable` participates only if its result was already created; to make it participate, register the concrete
+type and alias the interface: `RegisterFactory<Loader>(..., Lifetime.Singleton).As<ILoader>()`. Closed generics
+participate once preserved with `PreserveClosedGenerics`. `RegisterInstance` values are caller-owned; call
+`resolver.InitializeInstance(instance)` after the pass if one needs `Initialize`.
+
+### Initialize failures fault the scope
+
+A thrown `Initialize` arrives as `LifecycleException` (the original exception is `InnerException`) and the scope is
+faulted: further `RunInitializables` and `InitializeInstance` calls on it and its children throw. Dispose the scope
+and build a new one; do not retry the pass. Code that caught the participant's own exception type catches
+`LifecycleException` or `DependencyResolutionException` instead.
+
+### Child scopes initialize after their parent
+
+`RunInitializables` on a child throws `InvalidOperationException` until the parent's pass has completed. A
+coordinator that hands a child resolver to a `LifetimeScopeBehaviour` runs `RunInitializables` on the root first.
+
+### Scene components initialize after services, once
+
+`LifetimeScopeBehaviour` runs the service pass before component `Initialize`, and `InitializeGameObject` initializes
+a component once per scope and throws before the scope's own pass. A component that relied on running before
+services, or on a second `InitializeGameObject` call re-running `Initialize`, moves that work elsewhere.
+`InstantiateAndInject` still binds only; initialize a spawned object's components with `InitializeGameObject` after
+the scope's pass.

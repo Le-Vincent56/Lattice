@@ -1,5 +1,5 @@
+using System;
 using UnityEngine;
-using Didionysymus.Lattice.Runtime;
 
 namespace Didionysymus.Lattice.Runtime.Unity
 {
@@ -53,20 +53,22 @@ namespace Didionysymus.Lattice.Runtime.Unity
         }
 
         /// <summary>
-        /// Walks <paramref name="root"/>'s component tree and invokes <see cref="IInitializable.Initialize"/>
-        /// on every <see cref="MonoBehaviour"/> that implements it. Phase 2 of the strict two-phase contract
-        /// for scene-attached objects; should be called AFTER <see cref="InjectGameObject"/> across every
-        /// MonoBehaviour whose <c>Initialize</c> body might observe peer state, so peers' <c>[Inject]</c>
-        /// fields are bound before any <c>Initialize</c> body runs.
+        /// Walks <paramref name="root"/>'s component tree, inactive descendants included, and initializes every
+        /// <see cref="MonoBehaviour"/> that implements <see cref="IInitializable"/> once per scope through
+        /// <see cref="ResolverLifecycleExtensions.InitializeInstance"/>. A component the scope already initialized, in
+        /// an earlier call or because it is also a cached service, is skipped. Call it after
+        /// <see cref="InjectGameObject"/> over the whole batch and after the scope's
+        /// <see cref="ResolverLifecycleExtensions.RunInitializables"/>, so every <c>Initialize</c> body observes bound
+        /// peers and initialized services.
         /// </summary>
-        /// <param name="resolver">Unused at present; included for API symmetry with <see cref="InjectGameObject"/>. The Phase 2 walk does not require resolver state because every dependency is already bound from the Phase 1 pass.</param>
+        /// <param name="resolver">The resolver whose scope tracks which components it has initialized. Its scope must have completed <c>RunInitializables</c>.</param>
         /// <param name="root">The GameObject whose tree will be walked. Null is tolerated and silently no-ops.</param>
+        /// <exception cref="InvalidOperationException">Thrown, when the walk reaches an initializable component, if the resolver is not the built-in resolver or its scope has not completed its initialization pass, is running one, or is faulted.</exception>
+        /// <exception cref="Exceptions.LifecycleException">Thrown when a component's <c>Initialize</c> throws; the scope is then faulted.</exception>
         /// <remarks>
-        /// Within a single <c>InitializeGameObject</c> call, components are visited in
-        /// <see cref="GameObject.GetComponentsInChildren{T}(bool)"/> order; that order is depth-first
-        /// from <paramref name="root"/>. Cross-tree ordering is the caller's responsibility: when running
-        /// Phase 2 across a whole scene, do all <see cref="InjectGameObject"/> calls first across every
-        /// root, then all <c>InitializeGameObject</c> calls, as <see cref="LifetimeScopeBehaviour"/> does.
+        /// Within one call, components are visited in <see cref="GameObject.GetComponentsInChildren{T}(bool)"/> order.
+        /// That order is not a contract: a component must not depend on another component's <c>Initialize</c> having
+        /// run.
         /// </remarks>
         public static void InitializeGameObject(this IObjectResolver resolver, GameObject root)
         {
@@ -77,27 +79,26 @@ namespace Didionysymus.Lattice.Runtime.Unity
             {
                 MonoBehaviour component = components[i];
                 if (!component) continue;
-
-                if (component is IInitializable initializable)
-                {
-                    initializable.Initialize();
-                }
+                if (component is not IInitializable) continue;
+                
+                resolver.InitializeInstance(component);
             }
         }
 
         /// <summary>
-        /// Instantiates <paramref name="prefab"/> and immediately injects the resulting GameObject's component tree.
-        /// Equivalent to <c>Object.Instantiate(prefab)</c> followed by <see cref="InjectGameObject"/> on the instance's GameObject;
-        /// bundling the two ensures spawned MonoBehaviours have populated <c>[Inject]</c> fields before their first <c>Start</c> callback
-        /// per the MonoBehaviour timing rules.
+        /// Instantiates <paramref name="prefab"/> and immediately binds the resulting GameObject's component tree.
+        /// Equivalent to <c>Object.Instantiate(prefab)</c> followed by <see cref="InjectGameObject"/> on the instance's
+        /// GameObject, so spawned MonoBehaviours have populated <c>[Inject]</c> fields before their first <c>Start</c>.
+        /// It binds only: no component's <see cref="IInitializable.Initialize"/> is called. To initialize the clone's
+        /// components once, call <see cref="InitializeGameObject"/> on the instance after the scope's own pass.
         /// </summary>
         /// <param name="resolver">The resolver against which the spawned tree's <c>[Inject]</c> members are bound.</param>
         /// <param name="prefab">The prefab component to instantiate. Standard <c>Object.Instantiate</c> rules apply.</param>
         /// <typeparam name="T">The component type being instantiated; used so the caller receives a strongly-typed reference back.</typeparam>
-        /// <returns>The instantiated component, with its own and every child MonoBehaviour's <c>[Inject]</c> members bound.</returns>
+        /// <returns>The instantiated component, with its own and every child MonoBehaviour's <c>[Inject]</c> members bound and nothing initialized.</returns>
         public static T InstantiateAndInject<T>(this IObjectResolver resolver, T prefab) where T : Component
         {
-            T instance = Object.Instantiate(prefab);
+            T instance = UnityEngine.Object.Instantiate(prefab);
             resolver.InjectGameObject(instance.gameObject);
             return instance;
         }

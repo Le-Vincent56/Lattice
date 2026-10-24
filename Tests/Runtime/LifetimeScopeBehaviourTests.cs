@@ -25,12 +25,12 @@ namespace Didionysymus.Lattice.Tests.Runtime
     }
 
     /// <summary>
-    /// Pins the Step 4 PlayMode contract for <see cref="LifetimeScopeBehaviour"/>:
+    /// Pins the PlayMode contract for <see cref="LifetimeScopeBehaviour"/> and <see cref="UnityResolverExtensions"/>:
     /// <list type="bullet">
-    ///     <item><c>Awake</c> walks the scene's root GameObjects and runs <c>Inject</c> on every <see cref="MonoBehaviour"/> beneath them, before any of them reach <c>Start</c></item>
-    ///     <item><see cref="IInitializable.Initialize"/> runs after Phase 1 across the scene completes; injected fields are observable inside <c>Initialize</c></item>
-    ///     <item><see cref="UnityResolverExtensions.InjectGameObject"/> populates <c>[Inject]</c> fields after-the-fact for objects spawned post-scene-walk</item>
-    ///     <item><see cref="UnityResolverExtensions.InstantiateAndInject{T}"/> spawns and injects in one call so spawned components have populated fields before <c>Start</c></item>
+    ///     <item><c>Awake</c> binds every <see cref="MonoBehaviour"/> under the scene's roots before any of them reach <c>Start</c></item>
+    ///     <item><c>Awake</c> runs the scope's own initialization pass, then initializes the scene's <see cref="IInitializable"/> components once each, inactive ones included; a component's <c>Initialize</c> observes bound peers and initialized services</item>
+    ///     <item><see cref="UnityResolverExtensions.InitializeGameObject"/> initializes a component once per scope and refuses to run before the scope's pass</item>
+    ///     <item><see cref="UnityResolverExtensions.InjectGameObject"/> populates <c>[Inject]</c> fields after the fact; <see cref="UnityResolverExtensions.InstantiateAndInject{T}"/> spawns and binds, and does not initialize</item>
     /// </list>
     /// All fixtures are runtime-created GameObjects (no scene assets, no prefab assets); each <c>[UnityTest]</c>
     /// yields one frame so <c>Awake</c>/<c>Start</c> complete before assertions run.
@@ -40,7 +40,7 @@ namespace Didionysymus.Lattice.Tests.Runtime
     /// <list type="number">
     ///     <item><c>AddComponent&lt;T&gt;</c> on an active GameObject runs <c>T.Awake</c> synchronously; <c>Start</c> runs at the start of the next frame.</item>
     ///     <item><c>yield return null</c> waits one frame; by that point every component's <c>Awake</c> AND <c>Start</c> have run.</item>
-    ///     <item>The scope's <c>[DefaultExecutionOrder(int.MinValue + 100)]</c> guarantees its <c>Awake</c> runs before any user MonoBehaviour <c>Awake</c> in the same frame.</item>
+    ///     <item>Consumers added with <c>AddComponent</c> before the scope exists have already run their own <c>Awake</c>; these tests pin "bound before <c>Start</c>", not <c>Awake</c> ordering.</item>
     /// </list>
     /// </remarks>
     [TestFixture]
@@ -194,6 +194,111 @@ namespace Didionysymus.Lattice.Tests.Runtime
                 // via _consumerGo in TearDown.
                 if (prefab) Object.Destroy(prefab.gameObject);
             }
+        }
+
+        /// <summary>
+        /// <c>InitializeGameObject</c> initializes a component once per scope: a second call over the same tree does
+        /// not run <c>Initialize</c> again.
+        /// </summary>
+        [UnityTest]
+        public IEnumerator InitializeGameObject_WhenCalledTwiceOnSameRoot_InitializesComponentOnce()
+        {
+            _scopeGo = new GameObject("RootScope");
+            TestRootScope scope = _scopeGo.AddComponent<TestRootScope>();
+            yield return null;
+            _consumerGo = new GameObject("LateConsumer");
+            CountingInitializableMonoBehaviour consumer = _consumerGo.AddComponent<CountingInitializableMonoBehaviour>();
+
+            scope.Resolver.InitializeGameObject(_consumerGo);
+            scope.Resolver.InitializeGameObject(_consumerGo);
+
+            Assert.AreEqual(1, consumer.InitializeCount, "A component is initialized once per scope");
+        }
+
+        /// <summary>
+        /// The scene walk includes inactive hierarchies: an <see cref="IInitializable"/> component on an inactive
+        /// GameObject is initialized once.
+        /// </summary>
+        [UnityTest]
+        public IEnumerator Awake_WhenSceneHasInactiveInitializableMonoBehaviour_InitializesIt()
+        {
+            _consumerGo = new GameObject("InactiveConsumer");
+            _consumerGo.SetActive(false);
+            CountingInitializableMonoBehaviour consumer = _consumerGo.AddComponent<CountingInitializableMonoBehaviour>();
+
+            _scopeGo = new GameObject("RootScope");
+            _scopeGo.AddComponent<TestRootScope>();
+            yield return null;
+
+            Assert.AreEqual(1, consumer.InitializeCount, "Inactive components are initialized by the scene walk, once");
+        }
+
+        /// <summary>
+        /// The host runs the scope's own pass before initializing scene components, so a component's
+        /// <c>Initialize</c> observes an initialized service.
+        /// </summary>
+        [UnityTest]
+        public IEnumerator Awake_WhenSceneComponentDependsOnInitializableService_ServiceInitializedBeforeComponent()
+        {
+            _consumerGo = new GameObject("Consumer");
+            ServiceObservingMonoBehaviour consumer = _consumerGo.AddComponent<ServiceObservingMonoBehaviour>();
+
+            _scopeGo = new GameObject("RootScope");
+            _scopeGo.AddComponent<TestProbeRootScope>();
+            yield return null;
+
+            Assert.IsTrue(consumer.ProbeWasInitializedInInitialize, "Services are initialized before scene components");
+        }
+
+        /// <summary>
+        /// <c>InstantiateAndInject</c> binds the clone and does not initialize it; initialization of a spawned object
+        /// is a separate, explicit call.
+        /// </summary>
+        [UnityTest]
+        public IEnumerator InstantiateAndInject_WhenSpawningInitializableComponent_DoesNotInitialize()
+        {
+            _scopeGo = new GameObject("RootScope");
+            TestRootScope scope = _scopeGo.AddComponent<TestRootScope>();
+            yield return null;
+            CountingInitializableMonoBehaviour template =
+                new GameObject("Template").AddComponent<CountingInitializableMonoBehaviour>();
+
+            try
+            {
+                CountingInitializableMonoBehaviour instance = scope.Resolver.InstantiateAndInject(template);
+                _consumerGo = instance.gameObject;
+
+                Assert.AreEqual(0, instance.InitializeCount, "InstantiateAndInject binds only; it does not initialize");
+            }
+            finally
+            {
+                if (template) Object.Destroy(template.gameObject);
+            }
+        }
+
+        /// <summary>
+        /// Components are never initialized before the scope's own pass: <c>InitializeGameObject</c> on a scope that
+        /// has not run <c>RunInitializables</c> throws.
+        /// </summary>
+        [UnityTest]
+        public IEnumerator InitializeGameObject_WhenScopeNotInitialized_ThrowsInvalidOperationException()
+        {
+            IObjectResolver resolver = Container.Build(_ => { });
+            _consumerGo = new GameObject("Consumer");
+            _consumerGo.AddComponent<CountingInitializableMonoBehaviour>();
+
+            try
+            {
+                Assert.Throws<InvalidOperationException>(
+                    () => resolver.InitializeGameObject(_consumerGo),
+                    "Components are never initialized before the scope's own pass");
+            }
+            finally
+            {
+                resolver.Dispose();
+            }
+
+            yield return null;
         }
     }
 }

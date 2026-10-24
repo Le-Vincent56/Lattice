@@ -1,6 +1,5 @@
 using System;
 using UnityEngine;
-using Didionysymus.Lattice.Runtime;
 
 namespace Didionysymus.Lattice.Runtime.Unity
 {
@@ -10,20 +9,22 @@ namespace Didionysymus.Lattice.Runtime.Unity
     /// and member-injected dependencies before any of them reach their <c>Start</c> callback.
     /// <list type="bullet">
     ///     <item>
-    ///         <c>[DefaultExecutionOrder(int.MinValue + 100)]</c> guarantees this <c>Awake</c> runs
-    ///         before any user MonoBehaviour's <c>Awake</c>
+    ///         <c>[DefaultExecutionOrder(int.MinValue + 100)]</c> runs this <c>Awake</c> early among scripts Unity
+    ///         orders by execution order; a script with a lower order value still runs earlier
     ///     </item>
     ///     <item>
     ///         Two construction modes: <see cref="Configure"/> override builds a self-owned root resolver, OR
-    ///         <see cref="SetResolver"/> accepts an externally-built resolver (used by the Step-N <c>SceneCoordinator</c>
-    ///         child-scope path)
+    ///         <see cref="SetResolver"/> accepts an externally-built resolver, for example a child scope built by a
+    ///         coordinator that has already run the parent's initialization pass
     ///     </item>
     ///     <item>
-    ///         In <c>Awake</c>: walks the scene's root GameObjects, calls <see cref="UnityResolverExtensions.InjectGameObject"/> on each,
-    ///         then runs <see cref="ResolverLifecycleExtensions.RunInitializables"/> for Phase 2
+    ///         In <c>Awake</c>: walks the scene's root GameObjects and calls <see cref="UnityResolverExtensions.InjectGameObject"/>
+    ///         on each, runs <see cref="ResolverLifecycleExtensions.RunInitializables"/> for the scope's own services,
+    ///         then calls <see cref="UnityResolverExtensions.InitializeGameObject"/> on each root so every
+    ///         <see cref="IInitializable"/> component is initialized once, after the services it was bound to
     ///     </item>
     ///     <item>
-    ///         In <c>OnDestroy</c>: disposes the resolver if and only if it was self-built; externally-provided resolver are
+    ///         In <c>OnDestroy</c>: disposes the resolver if and only if it was self-built; externally-provided resolvers are
     ///         owned by their builder
     ///     </item>
     /// </list>
@@ -45,13 +46,17 @@ namespace Didionysymus.Lattice.Runtime.Unity
         public IObjectResolver Resolver => _resolver;
 
         /// <summary>
-        /// Builds the resolver (if not already supplied externally) and walks the scene's root GameObjects to inject
-        /// every MonoBehaviour beneath them, then runs Phase 2 across the resulting object graph.
+        /// Builds the resolver (if not already supplied externally), fixes the batch as the scene's root GameObjects
+        /// at that moment, binds every MonoBehaviour beneath them, runs the scope's initialization pass, then
+        /// initializes the batch's <see cref="IInitializable"/> components once each. An object created during the
+        /// pass is in neither walk; bind and initialize it explicitly with <c>InjectGameObject</c> and
+        /// <c>InitializeGameObject</c>.
         /// </summary>
         /// <remarks>
-        /// Subclasses the override <c>Awake</c> MUST call <c>base.Awake()</c> first; otherwise the scope's
-        /// scene-walk and Phase 2 runs are skipped, and dependent components will see null <c>[Inject]</c> fields
-        /// in their own Awake/Start callbacks.
+        /// Subclasses that override <c>Awake</c> MUST call <c>base.Awake()</c> first; otherwise the scene walk and
+        /// both initialization passes are skipped, and dependent components will see null <c>[Inject]</c> fields
+        /// in their own Awake/Start callbacks. If the service pass throws, <c>Awake</c> throws before any component
+        /// is initialized; a self-built resolver is still disposed in <c>OnDestroy</c>.
         /// </remarks>
         protected virtual void Awake()
         {
@@ -62,10 +67,13 @@ namespace Didionysymus.Lattice.Runtime.Unity
                 _ownsResolver = true;
             }
 
-            InjectScene();
+            // One array for both walks, so nothing is initialized that was not bound.
+            GameObject[] roots = GetSceneRoots();
+            InjectScene(roots);
             _resolver.RunInitializables();
+            InitializeScene(roots);
         }
-
+        
         /// <summary>
         /// Disposes the resolver only if this behaviour built it.
         /// Externally-provided resolvers are owned and disposed by whoever called
@@ -83,9 +91,7 @@ namespace Didionysymus.Lattice.Runtime.Unity
         /// has been supplied via <see cref="SetResolver"/>. Default is no-op so subclasses can opt in selectively.
         /// </summary>
         /// <param name="builder">The container builder; register services here as you would in a composition root.</param>
-        protected virtual void Configure(IContainerBuilder builder)
-        {
-        }
+        protected virtual void Configure(IContainerBuilder builder) { }
 
         /// <summary>
         /// Provides an externally-built resolver; used by the SceneCoordinator child-scope path where the parent is a different
@@ -106,26 +112,38 @@ namespace Didionysymus.Lattice.Runtime.Unity
         }
 
         /// <summary>
-        /// Walks through the active scene's root GameObjects and runs <c>InjectGameObject</c> on each. Skips silently
-        /// when this behaviour is not yet attached to a valid scene (e.g., during certain editor-only construction pathways
-        /// that fire <c>Awake</c> before scene assignment completes).
+        /// Returns the root GameObjects of the scene this behaviour lives in, or an empty array when it is not yet
+        /// attached to a valid scene (e.g., during certain editor-only construction pathways that fire <c>Awake</c>
+        /// before scene assignment completes), so both walks silently do nothing.
         /// </summary>
-        private void InjectScene()
+        /// <returns>The scene's root GameObjects at the moment of the call.</returns>
+        private GameObject[] GetSceneRoots()
         {
             UnityEngine.SceneManagement.Scene scene = gameObject.scene;
-            if (!scene.IsValid()) return;
+            return scene.IsValid() ? scene.GetRootGameObjects() : Array.Empty<GameObject>();
+        }
 
-            GameObject[] roots = scene.GetRootGameObjects();
-
-            // Phase 1: bind [Inject] members on every MonoBehaviour beneath every scene root
+        /// <summary>
+        /// Runs <c>InjectGameObject</c> on each of <paramref name="roots"/>, so every MonoBehaviour's <c>[Inject]</c>
+        /// members in the batch are bound before any <c>Initialize</c> body runs.
+        /// </summary>
+        /// <param name="roots">The batch: the scene's root GameObjects fixed in <see cref="Awake"/>.</param>
+        private void InjectScene(GameObject[] roots)
+        {
             for (int i = 0; i < roots.Length; i++)
             {
                 _resolver.InjectGameObject(roots[i]);
             }
+        }
 
-            // Phase 2: invoke Initialize on every IInitializable MonoBehaviour. Done as a separate pass
-            // after Phase 1 completes across the entire scene, so cross-component peer sin Initialize
-            // bodies always see populated [Inject] fields regardless of which scene root they live under.
+        /// <summary>
+        /// Runs <c>InitializeGameObject</c> on each of <paramref name="roots"/>, after the scope's own initialization
+        /// pass, so a component's <c>Initialize</c> observes bound peers and initialized services and runs once per
+        /// scope.
+        /// </summary>
+        /// <param name="roots">The same batch <see cref="InjectScene"/> bound.</param>
+        private void InitializeScene(GameObject[] roots)
+        {
             for (int i = 0; i < roots.Length; i++)
             {
                 _resolver.InitializeGameObject(roots[i]);

@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
@@ -100,5 +101,157 @@ namespace Didionysymus.Lattice.Tests.Editor.Fixtures
         /// </summary>
         /// <returns>A constant.</returns>
         public override int GetHashCode() => 1;
+    }
+
+    /// <summary>
+    /// Shared ordered log of lifecycle events for order tests. Fixtures append <c>"name:ctor"</c> from their
+    /// constructors and <c>"name:init"</c> from <c>Initialize</c>; tests clear <see cref="Events"/> in <c>[SetUp]</c>.
+    /// </summary>
+    public static class LifecycleEventLog
+    {
+        public static readonly List<string> Events = new List<string>();
+    }
+
+    /// <summary>
+    /// Dependency-free <see cref="IInitializable"/> that logs its construction and initialization as <c>leaf</c>.
+    /// </summary>
+    public sealed class LoggedLeaf : IInitializable
+    {
+        public LoggedLeaf() => LifecycleEventLog.Events.Add("leaf:ctor");
+        public void Initialize() => LifecycleEventLog.Events.Add("leaf:init");
+    }
+
+    /// <summary>
+    /// Dependency-free <see cref="IInitializable"/> that logs as <c>solo</c>. Registered beside
+    /// <see cref="LoggedLeaf"/> to observe the order of independent participants.
+    /// </summary>
+    public sealed class LoggedSolo : IInitializable
+    {
+        public LoggedSolo() => LifecycleEventLog.Events.Add("solo:ctor");
+        public void Initialize() => LifecycleEventLog.Events.Add("solo:init");
+    }
+
+    /// <summary>
+    /// <see cref="IInitializable"/> that depends on <see cref="LoggedLeaf"/> and logs as <c>dependent</c>, so a test
+    /// can see that the dependency is constructed and initialized first.
+    /// </summary>
+    public sealed class LoggedDependent : IInitializable
+    {
+        public LoggedLeaf Leaf { get; }
+
+        public LoggedDependent(LoggedLeaf leaf)
+        {
+            Leaf = leaf;
+            LifecycleEventLog.Events.Add("dependent:ctor");
+        }
+
+        public void Initialize() => LifecycleEventLog.Events.Add("dependent:init");
+    }
+
+    /// <summary>
+    /// <see cref="ILoggable"/> implementation that logs its initialization as <c>inner</c>. Paired with
+    /// <see cref="LoggedLoggableDecorator"/> to observe that a decorated instance initializes before its decorator.
+    /// </summary>
+    public sealed class LoggedLoggable : ILoggable, IInitializable
+    {
+        private readonly List<string> _log = new List<string>();
+        public IReadOnlyList<string> Log => _log;
+        public void Emit(string message) => _log.Add(message);
+        public void Initialize() => LifecycleEventLog.Events.Add("inner:init");
+    }
+
+    /// <summary>
+    /// <see cref="ILoggable"/> decorator that logs its initialization as <c>wrapper</c>. It does not forward
+    /// <c>Initialize</c> to the instance it wraps; the container initializes the inner instance itself.
+    /// </summary>
+    public sealed class LoggedLoggableDecorator : ILoggable, IInitializable
+    {
+        private readonly ILoggable _inner;
+        public LoggedLoggableDecorator(ILoggable inner) => _inner = inner;
+        public IReadOnlyList<string> Log => _inner.Log;
+        public void Emit(string message) => _inner.Emit(message);
+        public void Initialize() => LifecycleEventLog.Events.Add("wrapper:init");
+    }
+
+    /// <summary>
+    /// <see cref="IInitializable"/> whose instances are all equal by <see cref="Equals(object)"/> and share one hash
+    /// code while remaining distinct objects. Counts <see cref="Initialize"/> calls across every instance in a static
+    /// field; tests reset <see cref="InitializeCount"/> in <c>[SetUp]</c>.
+    /// </summary>
+    public sealed class ValueEqualInitializable : IInitializable
+    {
+        public static int InitializeCount;
+
+        public void Initialize() => InitializeCount++;
+
+        /// <summary>
+        /// Treats every instance of this type as equal, so only reference identity can tell two instances apart.
+        /// </summary>
+        /// <param name="obj">The object to compare with.</param>
+        /// <returns>True when <paramref name="obj"/> is any <see cref="ValueEqualInitializable"/>.</returns>
+        public override bool Equals(object obj) => obj is ValueEqualInitializable;
+
+        /// <summary>
+        /// Returns one hash code for every instance, consistent with <see cref="Equals(object)"/>.
+        /// </summary>
+        /// <returns>A constant.</returns>
+        public override int GetHashCode() => 1;
+    }
+
+    /// <summary>
+    /// <see cref="IServiceA"/> that is also <see cref="IInitializable"/>. Registered through a factory under
+    /// <see cref="IServiceA"/>, its hook is invisible to the pass; registered under its own type it is visible.
+    /// </summary>
+    public sealed class InitializableServiceA : IServiceA, IInitializable
+    {
+        public Guid InstanceID { get; } = Guid.NewGuid();
+        public int InitializeCount { get; private set; }
+        public void Initialize() => InitializeCount++;
+    }
+
+    /// <summary>
+    /// <see cref="IInitializable"/> whose <see cref="Initialize"/> always throws <see cref="InvalidOperationException"/>.
+    /// </summary>
+    public sealed class ThrowingInitializable : IInitializable
+    {
+        public void Initialize() => throw new InvalidOperationException("Initialize failed on purpose.");
+    }
+
+    /// <summary>
+    /// <see cref="IInitializable"/> whose constructor needs <see cref="IServiceC"/>, which tests leave unregistered,
+    /// so building it throws <c>RegistrationNotFoundException</c>. <c>Build</c> tolerates the missing dependency.
+    /// </summary>
+    public sealed class NeedsUnregisteredDependency : IInitializable
+    {
+        public IServiceC Dependency { get; }
+        public NeedsUnregisteredDependency(IServiceC dependency) => Dependency = dependency;
+
+        public void Initialize()
+        {
+        }
+    }
+
+    /// <summary>
+    /// <see cref="IInitializable"/> that calls <c>RunInitializables</c> on its resolver from inside
+    /// <see cref="Initialize"/> and stores what that call throws in <see cref="CaughtException"/>, so a test can
+    /// assert the re-entrancy rule without faulting the scope.
+    /// </summary>
+    public sealed class ReentrantInitializable : IInitializable
+    {
+        private readonly IObjectResolver _resolver;
+        public Exception CaughtException { get; private set; }
+        public ReentrantInitializable(IObjectResolver resolver) => _resolver = resolver;
+
+        public void Initialize()
+        {
+            try
+            {
+                _resolver.RunInitializables();
+            }
+            catch (Exception exception)
+            {
+                CaughtException = exception;
+            }
+        }
     }
 }

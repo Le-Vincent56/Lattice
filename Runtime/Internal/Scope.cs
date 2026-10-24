@@ -18,7 +18,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
         private readonly Scope _parent;
         private readonly Registry _registry;
 
-                // Per-scope cache of Scoped implementation instances, keyed by the registration's primary entry so every
+        // Per-scope cache of Scoped implementation instances, keyed by the registration's primary entry so every
         // alias of one registration shares one instance.
         private readonly Dictionary<RegistrationEntry, object> _scopedCache =
             new Dictionary<RegistrationEntry, object>();
@@ -44,10 +44,20 @@ namespace Didionysymus.Lattice.Runtime.Internal
         private readonly Dictionary<RegistrationEntry, object> _singletonCache;
         private readonly Dictionary<RegistrationEntry, object> _singletonDecoratedCache;
 
-        // Tracks which IInitializable instances have already had Initialize() called.
-        // Ensures Initialize runs at-most-once per instance, even across repeated
-        // RunInitializables calls
-        private readonly HashSet<object> _initialized = new HashSet<object>();
+        // Instances this scope has initialized, compared by reference so two distinct instances that are equal by
+        // Equals are two participants. An instance is added only after its Initialize returned.
+        private readonly HashSet<object> _initialized = new HashSet<object>(ReferenceIdentityComparer.Instance);
+
+        // Every cached instance and decorator wrapper this scope built, in the order each finished construction. The
+        // initialization pass runs in this order, which puts a dependency before anything built with it and is the
+        // reverse of disposal order.
+        private readonly List<object> _creationOrder = new List<object>();
+
+        // Where this scope is in its lifecycle. Read and written under _lock.
+        private LifecycleState _state = LifecycleState.Created;
+
+        // The exception that faulted this scope; quoted by every later refused call.
+        private Exception _fault;
 
         // Children registered against this scope; populated by their constructors and drained on Dispose (cascade). Walked
         // by DiagnosticsExtensions.DumpScopeTree to prin the scope tree root-down
@@ -83,6 +93,21 @@ namespace Didionysymus.Lattice.Runtime.Internal
         /// in diagnostics dump output.
         /// </summary>
         internal int ScopeID { get; } = Interlocked.Increment(ref _nextScopeID);
+        
+        /// <summary>
+        /// Where this scope is in its lifecycle: created, running its initialization pass, initialized, or faulted
+        /// by a failed pass.
+        /// </summary>
+        internal LifecycleState State
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return _state;
+                }
+            }
+        }
 
         public Scope(Registry registry, Scope parent)
         {
@@ -381,7 +406,8 @@ namespace Didionysymus.Lattice.Runtime.Internal
                                 entry,
                                 rootScope._singletonCache,
                                 rootScope._singletonDecoratedCache,
-                                rootScope._disposables
+                                rootScope._disposables,
+                                rootScope._creationOrder
                             );
                         }
                     }
@@ -396,7 +422,13 @@ namespace Didionysymus.Lattice.Runtime.Internal
                         // locks during activation are only ever this scope's or an ancestor's.
                         lock (_lock)
                         {
-                            return GetOrCreateCached(entry, _scopedCache, _scopedDecoratedCache, _disposables);
+                            return GetOrCreateCached(
+                                entry,
+                                _scopedCache,
+                                _scopedDecoratedCache,
+                                _disposables,
+                                _creationOrder
+                            );
                         }
                     }
 
@@ -517,14 +549,15 @@ namespace Didionysymus.Lattice.Runtime.Internal
         /// implementation instance is built by and cached once under <see cref="RegistrationEntry.Primary"/>, so every
         /// alias shares it whichever alias is resolved first; an alias whose service type has a decorator chain in
         /// this scope gets that chain built once around the shared instance and cached under the alias entry. Each
-        /// object is tracked for disposal when created, the shared instance before any wrapper, so reverse-order
-        /// disposal releases a wrapper before its inner object. The caller holds the lock of the scope that owns the
-        /// caches.
+        /// object is tracked for disposal and appended to the creation order when created, the shared instance
+        /// before any wrapper, so initialization visits the inner object first and reverse-order disposal releases
+        /// the wrapper first. The caller holds the lock of the scope that owns the caches.
         /// </summary>
         /// <param name="entry">The alias entry being resolved; it belongs to this scope's registry.</param>
         /// <param name="instanceCache">The implementation cache, keyed by primary entry.</param>
         /// <param name="decoratedCache">The decorated-result cache, keyed by alias entry.</param>
         /// <param name="disposables">The disposal list of the scope that owns both caches.</param>
+        /// <param name="creationOrder">The creation-order list of the scope that owns both caches.</param>
         /// <returns>
         /// The decorated result for <paramref name="entry"/>, or the shared instance when its service type has no
         /// decorators.
@@ -533,7 +566,8 @@ namespace Didionysymus.Lattice.Runtime.Internal
             RegistrationEntry entry,
             Dictionary<RegistrationEntry, object> instanceCache,
             Dictionary<RegistrationEntry, object> decoratedCache,
-            List<IDisposable> disposables
+            List<IDisposable> disposables,
+            List<object> creationOrder
         )
         {
             if (decoratedCache.TryGetValue(entry, out object decorated)) return decorated;
@@ -543,6 +577,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
             {
                 instance = primary.Activator(this);
                 instanceCache[primary] = instance;
+                creationOrder.Add(instance);
 
                 if (instance is IDisposable disposable) disposables.Add(disposable);
             }
@@ -551,6 +586,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
             if (ReferenceEquals(wrapped, instance)) return instance;
 
             decoratedCache[entry] = wrapped;
+            creationOrder.Add(wrapped);
 
             if (wrapped is IDisposable wrappedDisposable) disposables.Add(wrappedDisposable);
 
@@ -605,56 +641,245 @@ namespace Didionysymus.Lattice.Runtime.Internal
         }
 
         /// <summary>
-        /// Runs <see cref="IInitializable.Initialize"/> on every <see cref="IInitializable"/> instance currently held
-        /// in this scope's caches (implementation instances and decorated results) and, on the root, in the Singleton
-        /// caches. Idempotent; each instance is initialized at most once across repeated calls.
+        /// Runs this scope's initialization pass: materializes every Singleton or Scoped registration of this scope
+        /// whose implementation or decorator type implements <see cref="IInitializable"/>, in registration order,
+        /// then calls <see cref="IInitializable.Initialize"/> once, by reference, on every initializable instance this
+        /// scope has cached, in creation order. The parent scope must have completed its own pass first. A thrown
+        /// <c>Initialize</c> or a failed construction faults this scope, which then refuses every later pass; dispose
+        /// it and build a new one. A pass after a successful pass initializes only instances cached since.
         /// </summary>
-        /// <remarks>
-        /// As per the Phase 1 / Phase 2 ordering: by the time this is called, all bindings
-        /// (Phase 1) for the materialized instances are complete. <c>Initialize()</c> (Phase 2)
-        /// can therefore safely observe peer instances' bound state.
-        ///
-        /// Transient instances are not tracked in either cache and therefore not visited here;
-        /// register an IInitializable as Scoped or Singleton if you need its Initialize hook.
-        /// </remarks>
+        /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed.</exception>
+        /// <exception cref="InvalidOperationException">Thrown when a pass is already running on this scope, when this scope is faulted, or when the parent scope has not completed its pass.</exception>
+        /// <exception cref="LifecycleException">Thrown when a participant's <c>Initialize</c> throws; this scope is then faulted.</exception>
         internal void RunInitializables()
         {
             ThrowIfDisposed();
+            BeginPass();
 
-            // Collect targets first, then invoke Initialize(); keeps cache iteration
-            // separate from user code that might (in principle) cause re-entrancy
-            List<object> targets = new List<object>();
-
-            CollectInitializables(_scopedCache, targets);
-            CollectInitializables(_scopedDecoratedCache, targets);
-
-            // Singleton caches are only present on the root scope; harmless to check elsewhere
-            if (_singletonCache != null)
+            try
             {
-                CollectInitializables(_singletonCache, targets);
-                CollectInitializables(_singletonDecoratedCache, targets);
+                MaterializeParticipants();
+
+                List<object> targets = CollectTargets();
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    InitializeTarget(targets[i]);
+                }
+            }
+            catch (Exception exception)
+            {
+                Fault(exception);
+                throw;
             }
 
-            for (int i = 0; i < targets.Count; i++)
+            // Faulted is terminal: a supplied-instance failure that raced with this pass must not be overwritten.
+            lock (_lock)
             {
-                ((IInitializable)targets[i]).Initialize();
+                if (_state == LifecycleState.Initializing) _state = LifecycleState.Initialized;
+            }
+        }
+        
+        /// <summary>
+        /// Initializes an externally supplied object once in this scope: an object this scope has already initialized,
+        /// through a pass or an earlier call, is not initialized again. Instances are compared by reference. Requires
+        /// this scope to have completed its initialization pass, so an object bound to this scope's services is never
+        /// initialized before them. A thrown <c>Initialize</c> faults this scope.
+        /// </summary>
+        /// <param name="instance">The object to initialize. Need not implement <see cref="IInitializable"/>.</param>
+        /// <returns>True when <see cref="IInitializable.Initialize"/> ran; false when <paramref name="instance"/> is not <see cref="IInitializable"/> or this scope already initialized it.</returns>
+        /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed.</exception>
+        /// <exception cref="ArgumentNullException">Thrown when <paramref name="instance"/> is null.</exception>
+        /// <exception cref="InvalidOperationException">Thrown when this scope has not completed its pass, is running one, or is faulted.</exception>
+        /// <exception cref="LifecycleException">Thrown when the object's <c>Initialize</c> throws; this scope is then faulted.</exception>
+        internal bool InitializeInstance(object instance)
+        {
+            ThrowIfDisposed();
+            if (instance == null) throw new ArgumentNullException(nameof(instance));
+
+            lock (_lock)
+            {
+                ThrowIfFaultedOrInitializing();
+
+                if (_state == LifecycleState.Created)
+                {
+                    throw new InvalidOperationException(
+                        "Run RunInitializables on this scope before initializing supplied instances, so they never " +
+                        "initialize before the services they depend on."
+                    );
+                }
+
+                // Adding first reserves the instance, so two concurrent calls for one object cannot both run it.
+                if (instance is not IInitializable || !_initialized.Add(instance)) return false;
+            }
+
+            try
+            {
+                ((IInitializable)instance).Initialize();
+            }
+            catch (Exception exception)
+            {
+                LifecycleException failure = new LifecycleException(instance.GetType(), LifecyclePhase.Initialize, exception);
+
+                lock (_lock)
+                {
+                    _initialized.Remove(instance);
+                }
+
+                Fault(failure);
+                throw failure;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Moves this scope into <see cref="LifecycleState.Initializing"/> after checking that no pass is running,
+        /// that this scope is not faulted, and that the parent, if any, has completed its own pass. The parent's
+        /// state is read under the parent's lock, in the child-then-parent order <see cref="Dispose"/> already uses.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">Thrown when a pass is already running, when this scope is faulted, or when the parent has not completed its pass.</exception>
+        private void BeginPass()
+        {
+            lock (_lock)
+            {
+                ThrowIfFaultedOrInitializing();
+
+                if (_parent != null)
+                {
+                    LifecycleState parentState = _parent.State;
+                    if (parentState != LifecycleState.Initialized)
+                    {
+                        throw new InvalidOperationException(
+                            "Run RunInitializables on the parent scope before the child: the parent's state is " +
+                            parentState + ".");
+                    }
+                }
+
+                _state = LifecycleState.Initializing;
             }
         }
 
         /// <summary>
-        /// Adds every <see cref="IInitializable"/> value of <paramref name="cache"/> that has not been initialized yet
-        /// to <paramref name="targets"/>, recording it in <c>_initialized</c> so it is initialized at most once.
+        /// Rejects a lifecycle call while a pass is running or after a pass has faulted. The caller holds
+        /// <c>_lock</c>.
         /// </summary>
-        /// <param name="cache">An implementation or decorated-result cache of this scope.</param>
-        /// <param name="targets">The instances to initialize, in collection order.</param>
-        private void CollectInitializables(Dictionary<RegistrationEntry, object> cache, List<object> targets)
+        /// <exception cref="InvalidOperationException">Thrown when this scope is initializing or faulted.</exception>
+        private void ThrowIfFaultedOrInitializing()
         {
-            foreach (KeyValuePair<RegistrationEntry, object> pair in cache)
+            if (_state == LifecycleState.Initializing)
             {
-                if (pair.Value is not IInitializable || !_initialized.Add(pair.Value))
-                    continue;
+                throw new InvalidOperationException(
+                    "RunInitializables is already running on this scope; a pass cannot start concurrently or from " +
+                    "inside an Initialize body.");
+            }
 
-                targets.Add(pair.Value);
+            if (_state == LifecycleState.Faulted)
+            {
+                throw new InvalidOperationException(
+                    "This scope is faulted and must be disposed and rebuilt: " + _fault.Message, _fault);
+            }
+        }
+
+        /// <summary>
+        /// Materializes every registration of this scope that takes part in the initialization pass, in
+        /// registration order, through the same path a resolve uses. Pre-built instances and Transients never take
+        /// part; a Singleton or Scoped entry takes part when its implementation type, or a decorator type registered
+        /// for its service type in this scope, implements <see cref="IInitializable"/>. Open-generic registrations are
+        /// not walked; a closed generic takes part once it is preserved or promoted.
+        /// </summary>
+        private void MaterializeParticipants()
+        {
+            List<RegistrationEntry> entries = _registry.RegistrationOrder;
+            for (int i = 0; i < entries.Count; i++)
+            {
+                RegistrationEntry entry = entries[i];
+                if (entry.IsPreBuiltInstance || entry.Lifetime == Lifetime.Transient) continue;
+                if (!IsInitializableRegistration(entry)) continue;
+
+                MaterializeFromEntry(entry, this);
+            }
+        }
+
+        /// <summary>
+        /// Returns whether <paramref name="entry"/>'s implementation type, or any decorator type registered in this
+        /// scope for its service type, implements <see cref="IInitializable"/>.
+        /// </summary>
+        /// <param name="entry">A closed registration of this scope.</param>
+        /// <returns>True when the registration takes part in the initialization pass.</returns>
+        private bool IsInitializableRegistration(RegistrationEntry entry)
+        {
+            if (typeof(IInitializable).IsAssignableFrom(entry.ImplType)) return true;
+
+            if (!_registry.DecoratorChains.TryGetValue(entry.ServiceType, out List<DecoratorEntry> decorators))
+                return false;
+
+            for (int i = 0; i < decorators.Count; i++)
+            {
+                if (typeof(IInitializable).IsAssignableFrom(decorators[i].DecoratorType)) return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Snapshots, under <c>_lock</c>, every <see cref="IInitializable"/> this scope has cached and not yet
+        /// initialized, in creation order and once each even when one object sits behind several registrations.
+        /// </summary>
+        /// <returns>The instances to initialize, in the order to initialize them.</returns>
+        private List<object> CollectTargets()
+        {
+            List<object> targets = new List<object>();
+            HashSet<object> seen = new HashSet<object>(ReferenceIdentityComparer.Instance);
+
+            lock (_lock)
+            {
+                for (int i = 0; i < _creationOrder.Count; i++)
+                {
+                    object candidate = _creationOrder[i];
+                    if (candidate is not IInitializable || _initialized.Contains(candidate) || !seen.Add(candidate))
+                        continue;
+
+                    targets.Add(candidate);
+                }
+            }
+
+            return targets;
+        }
+
+        /// <summary>
+        /// Calls <see cref="IInitializable.Initialize"/> on <paramref name="target"/> outside the lock and records it
+        /// as initialized only once the call returned.
+        /// </summary>
+        /// <param name="target">An <see cref="IInitializable"/> this scope owns.</param>
+        /// <exception cref="LifecycleException">Thrown, wrapping the hook's exception, when <c>Initialize</c> throws.</exception>
+        private void InitializeTarget(object target)
+        {
+            try
+            {
+                ((IInitializable)target).Initialize();
+            }
+            catch (Exception exception)
+            {
+                throw new LifecycleException(target.GetType(), LifecyclePhase.Initialize, exception);
+            }
+
+            lock (_lock)
+            {
+                _initialized.Add(target);
+            }
+        }
+
+        /// <summary>
+        /// Marks this scope faulted with the exception that ended its pass, so every later pass is refused with that
+        /// exception quoted.
+        /// </summary>
+        /// <param name="exception">The exception that escaped the pass.</param>
+        private void Fault(Exception exception)
+        {
+            lock (_lock)
+            {
+                _state = LifecycleState.Faulted;
+                _fault = exception;
             }
         }
 
@@ -754,6 +979,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
             _disposables.Clear();
             _scopedCache.Clear();
             _scopedDecoratedCache.Clear();
+            _creationOrder.Clear();
         }
 
         /// <summary>

@@ -160,22 +160,42 @@ builder.RegisterOpenGeneric(typeof(IRepository<>), typeof(Repository<>), Lifetim
 ## Lifecycle hooks
 
 ```csharp
-public sealed class CatalogLoader : IAsyncStartable, IDisposable
+public sealed class CatalogLoader : IInitializable, IDisposable
 {
-    public Task StartAsync(CancellationToken cancellationToken) { /* ... */ }
+    public void Initialize() { /* every dependency is constructed and initialized */ }
     public void Dispose() { /* ... */ }
 }
 ```
 
-- `IInitializable.Initialize()` runs once per instance, after all bindings in the scope complete.
+- **Who participates.** `RunInitializables()` builds every `Singleton` or `Scoped` registration of its scope whose
+  implementation type, or a decorator type registered for its service type, implements `IInitializable`, then calls
+  `Initialize()` once per instance. `Transient` registrations never participate. A `RegisterInstance` value is
+  caller-owned: the container neither initializes nor disposes it; call `resolver.InitializeInstance(instance)` after
+  the pass if it needs `Initialize`. A factory participates when its service type is `IInitializable`; otherwise
+  register the concrete type and alias the interface: `RegisterFactory<Loader>(..., Lifetime.Singleton).As<ILoader>()`.
+  Closed generics participate once preserved with `PreserveClosedGenerics`.
+- **Order.** Every participant is constructed before any is initialized. `Initialize` runs in creation order: a
+  dependency before anything constructed with it, independent participants in registration order, a decorated
+  instance before its decorator. `IDisposable.Dispose()` runs on scope disposal in the reverse order.
+- **Once, by reference.** A scope initializes an instance at most once across repeated passes and
+  `InitializeInstance` calls, whichever registrations or aliases refer to it.
+- **Per scope, parents first.** Each scope runs its own pass over its own registrations. `RunInitializables` on a
+  child throws `InvalidOperationException` until the parent's pass has completed.
+- **Lazy objects.** `Resolve` never calls `Initialize`. An `IInitializable` created after the pass (an opaque factory
+  result, an unpreserved closed generic) is initialized by the next `RunInitializables` on its scope.
+- **Failure.** A thrown `Initialize` surfaces as `LifecycleException` (participant type, phase, inner exception) and
+  faults the scope: later passes and `InitializeInstance` calls on it and on its children throw
+  `InvalidOperationException`. `Resolve` and `Dispose` still work. Dispose the scope and build a new one; the pass is
+  not retried. A pass started while one is running, including from inside an `Initialize` body, throws
+  `InvalidOperationException`.
 - `IAsyncStartable.StartAsync()` runs in registration order, awaitable.
-- `IDisposable.Dispose()` runs on scope disposal, reverse creation order.
 
 Trigger the phases on the resolver:
 
 ```csharp
 resolver.RunInitializables();
 await resolver.RunAsyncStartablesAsync(cancellationToken);
+resolver.InitializeInstance(handBuiltObject); // externally supplied objects, after the pass
 ```
 
 ## Unity integration
@@ -195,9 +215,9 @@ public sealed class GameLifetimeScope : LifetimeScopeBehaviour
 }
 ```
 
-On `Awake` (running at `[DefaultExecutionOrder(int.MinValue + 100)]`) the scope builds
-its resolver, injects every MonoBehaviour in its scene, then runs Phase 2. If you
-override `Awake`, call `base.Awake()` first or the scene walk and Phase 2 are skipped.
+On `Awake` (running at `[DefaultExecutionOrder(int.MinValue + 100)]`) the scope builds its resolver, injects every
+MonoBehaviour in its scene, runs `RunInitializables` for its services, then initializes the scene's `IInitializable`
+components once each. If you override `Awake`, call `base.Awake()` first or the scene walk and both passes are skipped.
 
 ### Member injection and the two-phase contract
 
@@ -224,14 +244,18 @@ public sealed class HudPresenter : MonoBehaviour, IInitializable
 MonoBehaviour timing rules:
 
 1. Do not read injected fields in `Awake()`; they are populated by `Start()`.
-2. Put post-injection setup in `IInitializable.Initialize()`, which runs after Phase 1
-   completes across the scene and before `Start()`.
-3. Inject dynamically spawned prefabs explicitly, before their `Start()` runs:
+2. Put post-injection setup in `IInitializable.Initialize()`, which runs after Phase 1 completes across the scene,
+   after the scope's services are initialized, and before `Start()`. Components are initialized once per scope;
+   their order relative to each other is not a contract.
+3. Inject dynamically spawned prefabs explicitly, before their `Start()` runs. `InstantiateAndInject` binds only;
+   initialize the clone's components afterwards with `InitializeGameObject`:
 
 ```csharp
 SpawnedThing instance = resolver.InstantiateAndInject(prefab);
+resolver.InitializeGameObject(instance.gameObject);
 // or, after a manual Instantiate:
 resolver.InjectGameObject(spawnedGameObject);
+resolver.InitializeGameObject(spawnedGameObject);
 ```
 
 ## IL2CPP / AOT preservation (required for device builds)
@@ -274,6 +298,9 @@ All resolution failures derive from `Didionysymus.Lattice.Runtime.Exceptions.Dep
 `MultipleConstructorsException`, `MultipleInjectMethodsException`. Every message includes the
 full requested-type chain. A seventh, `ChildSingletonRegistrationException`, is thrown by `CreateChildScope` when a
 child registers a Singleton; carries `ServiceType` and `ImplType`.
+Lifecycle failures also derive from it: `LifecycleException` is thrown by `RunInitializables` and
+`InitializeInstance` when a participant's `Initialize` throws; it carries `ParticipantType` and `Phase`, with the
+participant's exception as `InnerException`, and the scope is faulted afterwards.
 
 ## Constructor selection
 

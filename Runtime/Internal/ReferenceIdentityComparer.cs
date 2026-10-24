@@ -15,9 +15,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
         /// </summary>
         public static readonly ReferenceIdentityComparer Instance = new ReferenceIdentityComparer();
 
-        private ReferenceIdentityComparer()
-        {
-        }
+        private ReferenceIdentityComparer() { }
 
         /// <summary>
         /// Returns whether <paramref name="x"/> and <paramref name="y"/> are the same object.
