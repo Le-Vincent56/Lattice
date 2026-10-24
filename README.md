@@ -188,13 +188,33 @@ public sealed class CatalogLoader : IInitializable, IDisposable
   `InvalidOperationException`. `Resolve` and `Dispose` still work. Dispose the scope and build a new one; the pass is
   not retried. A pass started while one is running, including from inside an `Initialize` body, throws
   `InvalidOperationException`.
-- `IAsyncStartable.StartAsync()` runs in registration order, awaitable.
+- **Startup.** `RunAsyncStartablesAsync(token)` starts every `IAsyncStartable` the scope's pass built (Singleton or
+  Scoped registrations whose implementation or decorator type implements it) plus any the scope already holds, once
+  each by reference, in creation order, one at a time. It builds nothing, and requires the scope's pass and, on a
+  child, the parent's startup to have completed. It runs once per scope: a later call starts nothing, a concurrent
+  call throws `InvalidOperationException`. Transient and `RegisterInstance` startables are not started. Startable
+  constructors run in the pass, so a `LifetimeScopeBehaviour` constructs them in `Awake`. Once startup has begun,
+  `RunInitializables` initializes nothing: it returns when nothing is pending (a scene host handed a started scope
+  keeps working) and throws naming an `IInitializable` created since; initialize such objects with
+  `InitializeInstance`.
+- **Startup failure and cancellation.** A thrown `StartAsync` surfaces as `LifecycleException` with
+  `Phase == LifecyclePhase.Start` and faults the scope. The token is checked before and between participants;
+  cancelling it after startup began, or disposing the scope, stops further participants, faults the scope and cancels
+  the returned task. Participants should observe the token they receive; Lattice waits for a running participant and
+  never abandons it. `Dispose` does not wait. The token a participant receives covers startup only: its source is
+  disposed when startup ends, so a later cancellation of the caller's token or a later `Dispose` no longer reaches it.
+  Give work that outlives `StartAsync` a token of its own.
+- **Startup context.** Startup continues on the caller's synchronization context between participants: call it from
+  the Unity main thread and every `StartAsync` runs on the main thread. A caller without a context (a thread-pool
+  thread) continues on the thread pool. Await it; never block on the task. This covers the calls Lattice makes: code
+  inside a participant after its own `ConfigureAwait(false)` is the participant's responsibility. A participant that
+  completes asynchronously resumes startup no earlier than the next frame.
 
 Trigger the phases on the resolver:
 
 ```csharp
 resolver.RunInitializables();
-await resolver.RunAsyncStartablesAsync(cancellationToken);
+await resolver.RunAsyncStartablesAsync(cancellationToken); // after the pass, from the main thread
 resolver.InitializeInstance(handBuiltObject); // externally supplied objects, after the pass
 ```
 

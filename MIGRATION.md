@@ -82,3 +82,35 @@ a component once per scope and throws before the scope's own pass. A component t
 services, or on a second `InitializeGameObject` call re-running `Initialize`, moves that work elsewhere.
 `InstantiateAndInject` still binds only; initialize a spawned object's components with `InitializeGameObject` after
 the scope's pass.
+
+### Async startup runs after the initialization pass, once
+
+Call `RunInitializables` before `RunAsyncStartablesAsync`, on the parent before the child, and start the parent
+before the child. The pass now builds startable registrations, so a startable nobody resolved is constructed at the
+pass; a `LifetimeScopeBehaviour` runs the pass in `Awake`, so its startable constructors now run there, whether or not
+anything starts them. Keep `Awake`-time work out of startable constructors. Startup starts what the pass built, in
+creation order, once per scope; a second call does nothing and a concurrent call throws. A startable registered under
+an interface that does not extend `IAsyncStartable` now starts. Transient startables no longer start: register them
+as Singleton or Scoped. `RegisterInstance` values are no longer started: call `StartAsync` on them yourself, or
+register the type. Startup throws when a cached startable that is also `IInitializable` was created after the pass:
+run `RunInitializables` again before startup. After startup has begun, `RunInitializables` initializes nothing; it
+throws when an `IInitializable` created since is pending, so call `resolver.InitializeInstance(obj)` for such objects.
+A scene host handed a started scope through `SetResolver` keeps working.
+
+### Startup failures and cancellation fault the scope
+
+A thrown `StartAsync` arrives as `LifecycleException` (`Phase == LifecyclePhase.Start`, original exception inside) and
+faults the scope. Cancelling the token after startup began, or disposing the scope during startup, stops further
+participants, faults the scope and cancels the returned task. Dispose and rebuild; do not retry. Participants should
+observe the token they receive and return promptly; Lattice waits for a running participant and never abandons it.
+Participants now receive a token linked to the caller's, not the caller's token itself, and it covers startup only:
+its source is disposed when startup ends, so a later cancellation of the caller's token or a later `Dispose` no longer
+reaches it. A participant that starts background work with that token and returns, relying on the caller cancelling
+it later, passes that work a token of its own instead.
+
+### Startup continues on the caller's context
+
+Call `RunAsyncStartablesAsync` from the Unity main thread and await it; do not block on the task. Each participant
+then runs on the main thread even when an earlier participant's task completed on a worker thread. Code that relied
+on later participants running on a thread-pool thread moves that work into `Task.Run` inside its own `StartAsync`.
+Code inside a participant after its own `ConfigureAwait(false)` still runs wherever that await resumed.

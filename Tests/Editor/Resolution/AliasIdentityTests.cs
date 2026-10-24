@@ -183,8 +183,8 @@ namespace Didionysymus.Lattice.Tests.Editor.Resolution
         }
 
         /// <summary>
-        /// <c>AsImplementedInterfaces()</c> puts a startable under its own type and under <see cref="IAsyncStartable"/>,
-        /// and both buckets are selected. The registration is one instance, so it is started once per call.
+        /// <c>AsImplementedInterfaces()</c> puts a startable under its own type and under <see cref="IAsyncStartable"/>.
+        /// The registration is one instance, built once by the pass, so startup starts it once.
         /// </summary>
         [Test]
         public async Task RunAsyncStartablesAsync_WhenRegistrationAliasedUnderTwoStartableTypes_StartsSharedInstanceOnce()
@@ -193,6 +193,7 @@ namespace Didionysymus.Lattice.Tests.Editor.Resolution
             {
                 b.Register<AliasedStartable>(Lifetime.Singleton).AsImplementedInterfaces();
             });
+            resolver.RunInitializables();
 
             await resolver.RunAsyncStartablesAsync(CancellationToken.None);
 

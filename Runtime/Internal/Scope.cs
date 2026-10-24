@@ -58,6 +58,10 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
         // The exception that faulted this scope; quoted by every later refused call.
         private Exception _fault;
+        
+        // The cancellation source of the running startup, linked to the caller's token; Dispose cancels it. Null when
+        // no startup is running. Read and written under _lock.
+        private CancellationTokenSource _startupCancellation;
 
         // Children registered against this scope; populated by their constructors and drained on Dispose (cascade). Walked
         // by DiagnosticsExtensions.DumpScopeTree to prin the scope tree root-down
@@ -642,19 +646,25 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
         /// <summary>
         /// Runs this scope's initialization pass: materializes every Singleton or Scoped registration of this scope
-        /// whose implementation or decorator type implements <see cref="IInitializable"/>, in registration order,
-        /// then calls <see cref="IInitializable.Initialize"/> once, by reference, on every initializable instance this
-        /// scope has cached, in creation order. The parent scope must have completed its own pass first. A thrown
-        /// <c>Initialize</c> or a failed construction faults this scope, which then refuses every later pass; dispose
-        /// it and build a new one. A pass after a successful pass initializes only instances cached since.
+        /// whose implementation or decorator type implements <see cref="IInitializable"/> or
+        /// <see cref="IAsyncStartable"/>, in registration order, then calls <see cref="IInitializable.Initialize"/>
+        /// once, by reference, on every initializable instance this scope has cached, in creation order. Startup
+        /// participants are built here, so startup builds nothing. The parent scope must have completed its own pass
+        /// first. A thrown <c>Initialize</c> or a failed construction faults this scope, which then refuses every later
+        /// pass; dispose it and build a new one. A pass after a successful pass initializes only instances cached since.
+        /// Once startup has begun, the pass initializes nothing: it returns when no cached initializable is pending and
+        /// throws when one created since is, so the caller initializes it with <see cref="InitializeInstance"/>.
         /// </summary>
         /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed.</exception>
-        /// <exception cref="InvalidOperationException">Thrown when a pass is already running on this scope, when this scope is faulted, or when the parent scope has not completed its pass.</exception>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when a pass is already running on this scope, when this scope is faulted, when the parent scope has not completed its pass,
+        /// or, once startup has begun, when a cached initializable created since is not initialized.
+        /// </exception>
         /// <exception cref="LifecycleException">Thrown when a participant's <c>Initialize</c> throws; this scope is then faulted.</exception>
         internal void RunInitializables()
         {
             ThrowIfDisposed();
-            BeginPass();
+            if (!BeginPass()) return;
 
             try
             {
@@ -734,33 +744,63 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
         /// <summary>
         /// Moves this scope into <see cref="LifecycleState.Initializing"/> after checking that no pass is running,
-        /// that this scope is not faulted, and that the parent, if any, has completed its own pass. The parent's
-        /// state is read under the parent's lock, in the child-then-parent order <see cref="Dispose"/> already uses.
+        /// that this scope is not faulted, and that the parent, if any, has completed its own pass. The parent's state
+        /// is read under the parent's lock, in the child-then-parent order <see cref="Dispose"/> already uses. Once
+        /// startup has begun, the pass has nothing to build or initialize: the state stays as it is, and a cached
+        /// initializable created since is reported instead.
         /// </summary>
-        /// <exception cref="InvalidOperationException">Thrown when a pass is already running, when this scope is faulted, or when the parent has not completed its pass.</exception>
-        private void BeginPass()
+        /// <returns>True when the pass runs; false when startup has begun and nothing is pending.</returns>
+        /// <exception cref="InvalidOperationException">Thrown when a pass is already running, when this scope is faulted, when the parent has not completed its pass, or, once startup has begun, when a cached initializable is pending.</exception>
+        private bool BeginPass()
         {
             lock (_lock)
             {
                 ThrowIfFaultedOrInitializing();
 
+                if (_state == LifecycleState.Starting || _state == LifecycleState.Ready)
+                {
+                    ThrowIfInitializationPending();
+                    return false;
+                }
+
                 if (_parent != null)
                 {
                     LifecycleState parentState = _parent.State;
-                    if (parentState != LifecycleState.Initialized)
+                    if (!HasCompletedPass(parentState))
                     {
                         throw new InvalidOperationException(
-                            "Run RunInitializables on the parent scope before the child: the parent's state is " +
-                            parentState + ".");
+                            $"Run RunInitializables on the parent scope before the child: the parent's state is {parentState}."
+                        );
                     }
                 }
 
                 _state = LifecycleState.Initializing;
+                return true;
             }
         }
 
         /// <summary>
-        /// Rejects a lifecycle call while a pass is running or after a pass has faulted. The caller holds
+        /// Reports, once startup has begun, a cached <see cref="IInitializable"/> this scope has not initialized: an
+        /// object created after the pass, which the closed pass will not initialize. The caller holds <c>_lock</c>.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">Thrown for the first such object, in creation order.</exception>
+        private void ThrowIfInitializationPending()
+        {
+            for (int i = 0; i < _creationOrder.Count; i++)
+            {
+                object candidate = _creationOrder[i];
+                if (candidate is not IInitializable || _initialized.Contains(candidate)) continue;
+
+                throw new InvalidOperationException(
+                    $"'{candidate.GetType().FullName}' was created after startup began on this scope and is not " +
+                    "initialized; once startup has begun the pass initializes nothing, so initialize it with " +
+                    "InitializeInstance."
+                );
+            }
+        }
+
+        /// <summary>
+        /// Rejects a lifecycle call while a pass is running or after this scope has faulted. The caller holds
         /// <c>_lock</c>.
         /// </summary>
         /// <exception cref="InvalidOperationException">Thrown when this scope is initializing or faulted.</exception>
@@ -770,22 +810,45 @@ namespace Didionysymus.Lattice.Runtime.Internal
             {
                 throw new InvalidOperationException(
                     "RunInitializables is already running on this scope; a pass cannot start concurrently or from " +
-                    "inside an Initialize body.");
+                    "inside an Initialize body."
+                );
             }
 
-            if (_state == LifecycleState.Faulted)
-            {
-                throw new InvalidOperationException(
-                    "This scope is faulted and must be disposed and rebuilt: " + _fault.Message, _fault);
-            }
+            ThrowIfFaulted();
         }
 
         /// <summary>
-        /// Materializes every registration of this scope that takes part in the initialization pass, in
-        /// registration order, through the same path a resolve uses. Pre-built instances and Transients never take
-        /// part; a Singleton or Scoped entry takes part when its implementation type, or a decorator type registered
-        /// for its service type in this scope, implements <see cref="IInitializable"/>. Open-generic registrations are
-        /// not walked; a closed generic takes part once it is preserved or promoted.
+        /// Rejects a lifecycle call after a pass, a supplied object or startup has faulted this scope, quoting the
+        /// first fault. The caller holds <c>_lock</c>.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">Thrown when this scope is faulted.</exception>
+        private void ThrowIfFaulted()
+        {
+            if (_state != LifecycleState.Faulted) return;
+
+            throw new InvalidOperationException(
+                $"This scope is faulted and must be disposed and rebuilt: {_fault.Message}",
+                _fault
+            );
+        }
+
+        /// <summary>
+        /// Returns whether a scope in <paramref name="state"/> has completed its initialization pass, so a child's
+        /// pass may run.
+        /// </summary>
+        /// <param name="state">The parent's state.</param>
+        /// <returns>True for <see cref="LifecycleState.Initialized"/>, <see cref="LifecycleState.Starting"/> and <see cref="LifecycleState.Ready"/>.</returns>
+        private static bool HasCompletedPass(LifecycleState state)
+        {
+            return state is LifecycleState.Initialized or LifecycleState.Starting or LifecycleState.Ready;
+        }
+
+        /// <summary>
+        /// Materializes every registration of this scope that takes part in the lifecycle, in registration order,
+        /// through the same path a resolve uses. Pre-built instances and Transients never take part; a Singleton or
+        /// Scoped entry takes part when its implementation type, or a decorator type registered for its service type
+        /// in this scope, implements <see cref="IInitializable"/> or <see cref="IAsyncStartable"/>. Open-generic
+        /// registrations are not walked; a closed generic takes part once it is preserved or promoted.
         /// </summary>
         private void MaterializeParticipants()
         {
@@ -794,7 +857,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
             {
                 RegistrationEntry entry = entries[i];
                 if (entry.IsPreBuiltInstance || entry.Lifetime == Lifetime.Transient) continue;
-                if (!IsInitializableRegistration(entry)) continue;
+                if (!IsLifecycleRegistration(entry)) continue;
 
                 MaterializeFromEntry(entry, this);
             }
@@ -802,23 +865,33 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
         /// <summary>
         /// Returns whether <paramref name="entry"/>'s implementation type, or any decorator type registered in this
-        /// scope for its service type, implements <see cref="IInitializable"/>.
+        /// scope for its service type, implements <see cref="IInitializable"/> or <see cref="IAsyncStartable"/>.
         /// </summary>
         /// <param name="entry">A closed registration of this scope.</param>
-        /// <returns>True when the registration takes part in the initialization pass.</returns>
-        private bool IsInitializableRegistration(RegistrationEntry entry)
+        /// <returns>True when the pass builds the registration.</returns>
+        private bool IsLifecycleRegistration(RegistrationEntry entry)
         {
-            if (typeof(IInitializable).IsAssignableFrom(entry.ImplType)) return true;
+            if (IsLifecycleType(entry.ImplType)) return true;
 
             if (!_registry.DecoratorChains.TryGetValue(entry.ServiceType, out List<DecoratorEntry> decorators))
                 return false;
 
             for (int i = 0; i < decorators.Count; i++)
             {
-                if (typeof(IInitializable).IsAssignableFrom(decorators[i].DecoratorType)) return true;
+                if (IsLifecycleType(decorators[i].DecoratorType)) return true;
             }
 
             return false;
+        }
+
+        /// <summary>
+        /// Returns whether <paramref name="type"/> implements a hook the pass or startup calls.
+        /// </summary>
+        /// <param name="type">An implementation or decorator type.</param>
+        /// <returns>True when <paramref name="type"/> implements <see cref="IInitializable"/> or <see cref="IAsyncStartable"/>.</returns>
+        private static bool IsLifecycleType(Type type)
+        {
+            return typeof(IInitializable).IsAssignableFrom(type) || typeof(IAsyncStartable).IsAssignableFrom(type);
         }
 
         /// <summary>
@@ -870,62 +943,264 @@ namespace Didionysymus.Lattice.Runtime.Internal
         }
 
         /// <summary>
-        /// Marks this scope faulted with the exception that ended its pass, so every later pass is refused with that
-        /// exception quoted.
+        /// Marks this scope faulted with the exception that ended its pass, a supplied object's initialization or its
+        /// startup, so every later lifecycle call is refused with that exception quoted. The first fault is kept: a
+        /// scope that is already faulted is left as it is.
         /// </summary>
-        /// <param name="exception">The exception that escaped the pass.</param>
+        /// <param name="exception">The exception that faulted this scope.</param>
         private void Fault(Exception exception)
         {
             lock (_lock)
             {
+                if (_state == LifecycleState.Faulted) return;
+
                 _state = LifecycleState.Faulted;
                 _fault = exception;
             }
         }
 
         /// <summary>
-        /// Walks this scope's registry in registration order, materializes any
-        /// <see cref="IAsyncStartable"/> registrations, and awaits <c>StartAsync</c> on each
-        /// sequentially. Each startable's await must complete before the next begins, and an instance reached through
-        /// more than one startable service type is started once per call; instances are compared by reference.
+        /// Runs this scope's startup once: starts every <see cref="IAsyncStartable"/> this scope has cached, once each
+        /// by reference, in creation order, awaiting each <c>StartAsync</c> before calling the next, then moves this
+        /// scope to <see cref="LifecycleState.Ready"/>. Builds nothing: the initialization pass built the participants.
+        /// Participants receive a token linked to <paramref name="cancellationToken"/> that <see cref="Dispose"/> also
+        /// cancels; the token and disposal are checked before each participant and before this scope becomes ready.
+        /// Continues on the caller's synchronization context between participants, so a caller on a main thread keeps
+        /// every <c>StartAsync</c> call on that thread. A call on a ready scope starts nothing.
         /// </summary>
-        /// <param name="cancellationToken">Cancellation propagated to each StartAsync call.</param>
+        /// <param name="cancellationToken">Cancels startup before or between participants; linked into the token each participant receives.</param>
+        /// <returns>A task that completes when every participant has started and this scope is ready.</returns>
+        /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed before startup began.</exception>
+        /// <exception cref="OperationCanceledException">
+        /// Thrown when the token is cancelled or this scope is disposed; once startup has begun, this scope is then
+        /// faulted.
+        /// </exception>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when startup is already running, when this scope is faulted or has not completed its pass, when a
+        /// cached participant is not initialized, or when the parent is not ready.
+        /// </exception>
+        /// <exception cref="LifecycleException">Thrown when a participant's <c>StartAsync</c> throws, returns a faulted task or returns no task; this scope is then faulted.</exception>
         internal async Task RunAsyncStartablesAsync(CancellationToken cancellationToken)
         {
             ThrowIfDisposed();
 
-            // A registration aliased under two startable service types is one instance in two buckets; start it once.
-            // Compare by reference so two distinct instances that are equal by Equals both start.
-            HashSet<object> started = new HashSet<object>(ReferenceIdentityComparer.Instance);
+            List<object> targets = BeginStart(cancellationToken, out CancellationToken startupToken);
+            if (targets == null) return;
 
-            foreach (KeyValuePair<Type, List<RegistrationEntry>> kvp in _registry.ClosedRegistry)
+            try
             {
-                // Only consider service-type buckets that are (or implement) IAsyncStartable
-                if (!typeof(IAsyncStartable).IsAssignableFrom(kvp.Key)) continue;
-
-                for (int i = 0; i < kvp.Value.Count; i++)
+                for (int i = 0; i < targets.Count; i++)
                 {
-                    object instance = MaterializeFromEntry(kvp.Value[i], this);
+                    ThrowIfStartupStopped(startupToken);
 
-                    if (instance is not IAsyncStartable startable || !started.Add(instance)) continue;
-
-                    await startable.StartAsync(cancellationToken).ConfigureAwait(false);
+                    object target = targets[i];
+                    try
+                    {
+                        await ((IAsyncStartable)target).StartAsync(startupToken);
+                    }
+                    catch (Exception exception)
+                        when (exception is not OperationCanceledException || !startupToken.IsCancellationRequested)
+                    {
+                        LifecycleException failure = new LifecycleException(target.GetType(), LifecyclePhase.Start, exception);
+                        Fault(failure);
+                        throw failure;
+                    }
                 }
+
+                CompleteStart(startupToken);
+            }
+            catch (OperationCanceledException exception)
+            {
+                Fault(exception);
+                throw;
+            }
+            finally
+            {
+                ReleaseStartupCancellation();
             }
         }
 
         /// <summary>
+        /// Snapshots, under <c>_lock</c>, every <see cref="IAsyncStartable"/> this scope has cached, in creation order
+        /// and once each even when one object sits behind several registrations. Refuses the snapshot when an
+        /// <see cref="IInitializable"/> among them has not been initialized, so nothing starts before its
+        /// initialization.
+        /// </summary>
+        /// <returns>The instances to start, in the order to start them.</returns>
+        /// <exception cref="InvalidOperationException">Thrown when a cached participant is <see cref="IInitializable"/> and not yet initialized.</exception>
+        private List<object> CollectStartTargets()
+        {
+            List<object> targets = new List<object>();
+            HashSet<object> seen = new HashSet<object>(ReferenceIdentityComparer.Instance);
+
+            lock (_lock)
+            {
+                for (int i = 0; i < _creationOrder.Count; i++)
+                {
+                    object candidate = _creationOrder[i];
+                    if (candidate is not IAsyncStartable || !seen.Add(candidate)) continue;
+
+                    if (candidate is IInitializable && !_initialized.Contains(candidate))
+                    {
+                        throw new InvalidOperationException(
+                            $"'{candidate.GetType().FullName}' was created after the initialization pass and " +
+                            "is not initialized; run RunInitializables before RunAsyncStartablesAsync.");
+                    }
+
+                    targets.Add(candidate);
+                }
+            }
+
+            return targets;
+        }
+        
+        /// <summary>
+        /// Moves this scope into <see cref="LifecycleState.Starting"/> after its checks, in this order: not disposed;
+        /// already ready (returns null, nothing to start); not faulted; not already starting; token not cancelled (no
+        /// state change); pass completed; parent, if any, ready (read under the parent's lock, child-then-parent).
+        /// Then snapshots the participants and creates the linked cancellation source.
+        /// </summary>
+        /// <param name="cancellationToken">The caller's token.</param>
+        /// <param name="startupToken">Receives the linked token participants are given; <see cref="CancellationToken.None"/> when null is returned.</param>
+        /// <returns>The participants to start, in order, or null when this scope is already ready.</returns>
+        /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed.</exception>
+        /// <exception cref="OperationCanceledException">Thrown when <paramref name="cancellationToken"/> is already cancelled.</exception>
+        /// <exception cref="InvalidOperationException">
+        /// Thrown when this scope is faulted, already starting, has not completed its pass, holds an uninitialized participant, or
+        /// when the parent is not ready.
+        /// </exception>
+        private List<object> BeginStart(CancellationToken cancellationToken, out CancellationToken startupToken)
+        {
+            startupToken = CancellationToken.None;
+
+            lock (_lock)
+            {
+                ThrowIfDisposed();
+
+                if (_state == LifecycleState.Ready) return null;
+
+                ThrowIfFaulted();
+
+                if (_state == LifecycleState.Starting)
+                {
+                    throw new InvalidOperationException(
+                        "RunAsyncStartablesAsync is already running on this scope; startup cannot start " +
+                        "concurrently or from inside a StartAsync body."
+                    );
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (_state != LifecycleState.Initialized)
+                {
+                    throw new InvalidOperationException(
+                        $"Run RunInitializables on this scope before RunAsyncStartablesAsync: the scope's state is {_state}."
+                    );
+                }
+
+                if (_parent != null)
+                {
+                    LifecycleState parentState = _parent.State;
+                    if (parentState != LifecycleState.Ready)
+                    {
+                        throw new InvalidOperationException(
+                           $"Run RunAsyncStartablesAsync on the parent scope before the child: the parent's state is {parentState}."
+                        );
+                    }
+                }
+
+                List<object> targets = CollectStartTargets();
+                _startupCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                startupToken = _startupCancellation.Token;
+                _state = LifecycleState.Starting;
+
+                return targets;
+            }
+        }
+
+        /// <summary>
+        /// Stops startup before the next participant, or before this scope becomes ready, when this scope faulted
+        /// meanwhile, when the startup token is cancelled, or when <see cref="Dispose"/> has begun. Reads
+        /// <c>_disposed</c> under <c>_lock</c>, so a disposal that latched but has not yet cancelled the token still
+        /// stops startup.
+        /// </summary>
+        /// <param name="startupToken">The linked token participants receive.</param>
+        /// <exception cref="InvalidOperationException">Thrown when this scope is faulted.</exception>
+        /// <exception cref="OperationCanceledException">Thrown when the token is cancelled or this scope is being disposed.</exception>
+        private void ThrowIfStartupStopped(CancellationToken startupToken)
+        {
+            lock (_lock)
+            {
+                ThrowIfFaulted();
+
+                if (_disposed || startupToken.IsCancellationRequested) throw new OperationCanceledException(startupToken);
+            }
+        }
+
+        /// <summary>
+        /// Moves this scope from <see cref="LifecycleState.Starting"/> to <see cref="LifecycleState.Ready"/> after the
+        /// last participant, under the same lock as the final stop check, so a scope that faulted, was cancelled or is
+        /// being disposed never becomes ready.
+        /// </summary>
+        /// <param name="startupToken">The linked token participants received.</param>
+        /// <exception cref="InvalidOperationException">Thrown when this scope is faulted.</exception>
+        /// <exception cref="OperationCanceledException">Thrown when the token is cancelled or this scope is being disposed.</exception>
+        private void CompleteStart(CancellationToken startupToken)
+        {
+            lock (_lock)
+            {
+                ThrowIfStartupStopped(startupToken);
+                _state = LifecycleState.Ready;
+            }
+        }
+
+        /// <summary>
+        /// Detaches the running startup's cancellation source under <c>_lock</c> and disposes it outside the lock. A
+        /// <see cref="Dispose"/> that read the source before it was detached may still cancel it and catches the
+        /// resulting <see cref="ObjectDisposedException"/>.
+        /// </summary>
+        private void ReleaseStartupCancellation()
+        {
+            CancellationTokenSource source;
+            lock (_lock)
+            {
+                source = _startupCancellation;
+                _startupCancellation = null;
+            }
+
+            source?.Dispose();
+        }
+
+        /// <summary>
         /// Disposes of all resources associated with the current scope instance, releasing any objects
-        /// that were created during the lifetime of this scope. Ensures that resources are disposed
-        /// in reverse order of creation and prevents further use of the scope after disposal.
+        /// that were created during the lifetime of this scope. Cancels a running startup first, without waiting for
+        /// it, then disposes child scopes and this scope's instances in reverse order of creation, and prevents
+        /// further use of the scope.
         /// </summary>
         /// <exception cref="ObjectDisposedException">Thrown if operations are attempted on the scope after it has been disposed.</exception>
         public void Dispose()
         {
+            CancellationTokenSource startup;
             lock (_lock)
             {
                 if (_disposed) return;
                 _disposed = true;
+                startup = _startupCancellation;
+            }
+
+            // Cancel a running startup before anything is disposed, outside the lock so participant callbacks never
+            // run under it. The source may have just been disposed by a startup that finished, or a token callback
+            // may throw; neither may stop disposal.
+            if (startup != null)
+            {
+                try
+                {
+                    startup.Cancel();
+                }
+                catch
+                {
+                    // Swallow and continue disposal
+                }
             }
 
             // Snapshot children under the lock; cascade Dispose() calls hapen outside the lock

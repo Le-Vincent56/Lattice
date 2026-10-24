@@ -13,16 +13,17 @@ namespace Didionysymus.Lattice.Runtime
     {
         /// <summary>
         /// Runs the scope's initialization pass: builds every Singleton or Scoped registration of this scope whose
-        /// implementation or decorator type implements <see cref="IInitializable"/>, then calls
-        /// <see cref="IInitializable.Initialize"/> once per instance, by reference, in creation order. Each scope runs
-        /// its own pass, after its parent's. A pass after a successful pass initializes only instances created since.
-        /// A failed pass faults the scope; dispose it and build a new one.
+        /// implementation or decorator type implements <see cref="IInitializable"/> or <see cref="IAsyncStartable"/>,
+        /// then calls <see cref="IInitializable.Initialize"/> once per instance, by reference, in creation order. Each
+        /// scope runs its own pass, after its parent's. A pass after a successful pass initializes only instances
+        /// created since. A failed pass faults the scope; dispose it and build a new one.
         /// </summary>
         /// <param name="resolver">The resolver. Must be the built-in <see cref="Scope"/> implementation.</param>
         /// <exception cref="InvalidOperationException">
         /// Thrown when <paramref name="resolver"/> is not the built-in <see cref="Scope"/> (e.g., a user-supplied
-        /// test double), when a pass is already running, when the scope is faulted, or when the parent scope has
-        /// not completed its pass.
+        /// test double), when a pass is already running, when the scope is faulted, when the parent scope has not
+        /// completed its pass, or, once startup has begun, when an initializable created since is not initialized
+        /// (initialize it with <see cref="InitializeInstance"/>; with nothing pending the call does nothing).
         /// </exception>
         /// <exception cref="ObjectDisposedException">Thrown when the scope has been disposed.</exception>
         /// <exception cref="Exceptions.LifecycleException">Thrown when a participant's <c>Initialize</c> throws; the scope is then faulted.</exception>
@@ -56,19 +57,29 @@ namespace Didionysymus.Lattice.Runtime
         }
 
         /// <summary>
-        /// Walks the resolver's local registry in registration order and awaits
-        /// <see cref="IAsyncStartable.StartAsync"/> on every <see cref="IAsyncStartable"/>
-        /// registration sequentially.
+        /// Runs the scope's startup once: starts every <see cref="IAsyncStartable"/> the scope has cached, which
+        /// includes every Singleton or Scoped startable the initialization pass built, once each by reference, in
+        /// creation order, awaiting each <c>StartAsync</c> before the next. Requires <see cref="RunInitializables"/> on
+        /// this scope and, for a child, a completed startup on the parent. A call after startup succeeded starts
+        /// nothing; a call while it runs is refused. The token is checked before and between participants, and
+        /// disposing the scope cancels the token participants receive; a cancelled or failed startup faults the scope.
+        /// Continues on the caller's synchronization context between participants: call it from the main thread and
+        /// every <c>StartAsync</c> runs there. Await it; never block on the task.
         /// </summary>
         /// <param name="resolver">The resolver. Must be the built-in <see cref="Scope"/> implementation.</param>
-        /// <param name="cancellationToken">A task that completes when every IAsyncStartable's StartAsync has completed.</param>
+        /// <param name="cancellationToken">Cancels startup before or between participants; participants receive a token linked to it that disposing the scope also cancels.</param>
+        /// <returns>
+        /// A task that completes when every participant has started. It is cancelled when the token or disposal
+        /// stopped startup, and faulted with <see cref="Exceptions.LifecycleException"/> when a participant failed, with
+        /// <see cref="InvalidOperationException"/> when startup is running, the scope is faulted, its pass or its
+        /// parent's startup has not completed, or a cached participant is not initialized, and with
+        /// <see cref="ObjectDisposedException"/> when the scope is disposed.
+        /// </returns>
         /// <exception cref="InvalidOperationException">Thrown when <paramref name="resolver"/> is not the built-in <see cref="Scope"/>.</exception>
-        /// <returns></returns>
         public static Task RunAsyncStartablesAsync(this IObjectResolver resolver, CancellationToken cancellationToken)
         {
             if (resolver is not Scope scope)
-                throw new InvalidOperationException(
-                    "RunAsyncStartablesAsync is only supported on the built-in Scope resolver.");
+                throw new InvalidOperationException("RunAsyncStartablesAsync is only supported on the built-in Scope resolver.");
 
             return scope.RunAsyncStartablesAsync(cancellationToken);
         }

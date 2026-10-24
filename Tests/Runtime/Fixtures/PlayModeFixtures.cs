@@ -1,4 +1,6 @@
 using System;
+using System.Threading;
+using System.Threading.Tasks;
 using Didionysymus.Lattice.Runtime;
 using Didionysymus.Lattice.Runtime.Unity;
 using UnityEngine;
@@ -133,6 +135,31 @@ namespace Didionysymus.Lattice.Tests.Runtime.Fixtures
         protected override void Configure(IContainerBuilder builder)
         {
             builder.Register<IInitializableProbe, InitializableProbeService>(Lifetime.Singleton);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="IAsyncStartable"/> whose task completes on a thread-pool thread and is returned directly, so it never
+    /// resumes on the main thread itself.
+    /// </summary>
+    public sealed class WorkerThreadStartable : IAsyncStartable
+    {
+        public Task StartAsync(CancellationToken cancellationToken) => Task.Run(() => Thread.Sleep(20));
+    }
+
+    /// <summary>
+    /// <see cref="IAsyncStartable"/> that records the managed thread its <c>StartAsync</c> was called on.
+    /// </summary>
+    public sealed class ThreadRecordingStartable : IAsyncStartable
+    {
+        public bool Started { get; private set; }
+        public int RecordedThreadID { get; private set; }
+
+        public Task StartAsync(CancellationToken cancellationToken)
+        {
+            Started = true;
+            RecordedThreadID = Thread.CurrentThread.ManagedThreadId;
+            return Task.CompletedTask;
         }
     }
 }

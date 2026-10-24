@@ -1,5 +1,7 @@
 using System;
 using System.Collections;
+using System.Threading;
+using System.Threading.Tasks;
 using NUnit.Framework;
 using UnityEngine;
 using UnityEngine.TestTools;
@@ -31,6 +33,7 @@ namespace Didionysymus.Lattice.Tests.Runtime
     ///     <item><c>Awake</c> runs the scope's own initialization pass, then initializes the scene's <see cref="IInitializable"/> components once each, inactive ones included; a component's <c>Initialize</c> observes bound peers and initialized services</item>
     ///     <item><see cref="UnityResolverExtensions.InitializeGameObject"/> initializes a component once per scope and refuses to run before the scope's pass</item>
     ///     <item><see cref="UnityResolverExtensions.InjectGameObject"/> populates <c>[Inject]</c> fields after the fact; <see cref="UnityResolverExtensions.InstantiateAndInject{T}"/> spawns and binds, and does not initialize</item>
+    ///     <item>A host handed an already started scope through <see cref="LifetimeScopeBehaviour.SetResolver"/> still binds and initializes its scene</item>
     /// </list>
     /// All fixtures are runtime-created GameObjects (no scene assets, no prefab assets); each <c>[UnityTest]</c>
     /// yields one frame so <c>Awake</c>/<c>Start</c> complete before assertions run.
@@ -299,6 +302,38 @@ namespace Didionysymus.Lattice.Tests.Runtime
             }
 
             yield return null;
+        }
+
+        /// <summary>
+        /// A host handed an already started scope through <c>SetResolver</c> still initializes its scene: the
+        /// scope's pass has nothing pending, so the host's call to it does nothing, and each scene component is
+        /// initialized once.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator Awake_WhenSuppliedResolverAlreadyStarted_InitializesSceneComponents()
+        {
+            IObjectResolver resolver = Container.Build(b => b.Register<IPlayModeService, PlayModeService>(Lifetime.Singleton));
+            resolver.RunInitializables();
+            Task startup = resolver.RunAsyncStartablesAsync(CancellationToken.None);
+            _consumerGo = new GameObject("Consumer");
+            CountingInitializableMonoBehaviour consumer = _consumerGo.AddComponent<CountingInitializableMonoBehaviour>();
+            _scopeGo = new GameObject("SuppliedScope");
+            _scopeGo.SetActive(false);
+            _scopeGo.AddComponent<LifetimeScopeBehaviour>().SetResolver(resolver);
+
+            try
+            {
+                _scopeGo.SetActive(true);
+                yield return null;
+
+                Assert.IsTrue(startup.IsCompleted, "A scope with no startables completes startup at once");
+                Assert.AreEqual(1, consumer.InitializeCount, "The host initializes the scene against the started scope");
+            }
+            finally
+            {
+                resolver.Dispose();
+            }
         }
     }
 }
