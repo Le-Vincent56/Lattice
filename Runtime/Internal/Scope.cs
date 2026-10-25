@@ -15,29 +15,32 @@ namespace Didionysymus.Lattice.Runtime.Internal
     /// </summary>
     internal sealed class Scope : IObjectResolver
     {
+        // The message of the AggregateException Dispose throws after a cleanup in which any step threw.
+        private const string DisposalFailureMessage = "One or more objects threw while the scope was disposed; every other object was still disposed.";
+
+        // The message of the ObjectDisposedException a resolve throws when the object it built was refused because its
+        // scope's disposal began meanwhile, and disposing that object threw.
+        private const string RefusedObjectMessage = "The scope was disposed while this object was being built; the object was disposed.";
+        
         private readonly Scope _parent;
         private readonly Registry _registry;
 
         // Per-scope cache of Scoped implementation instances, keyed by the registration's primary entry so every
         // alias of one registration shares one instance.
-        private readonly Dictionary<RegistrationEntry, object> _scopedCache =
-            new Dictionary<RegistrationEntry, object>();
+        private readonly Dictionary<RegistrationEntry, object> _scopedCache = new Dictionary<RegistrationEntry, object>();
 
         // Per-scope cache of decorated Scoped results, keyed by the alias entry: each alias wraps the shared instance
         // in the decorator chain of its own service type.
-        private readonly Dictionary<RegistrationEntry, object> _scopedDecoratedCache =
-            new Dictionary<RegistrationEntry, object>();
+        private readonly Dictionary<RegistrationEntry, object> _scopedDecoratedCache = new Dictionary<RegistrationEntry, object>();
 
         // All IDisposables created within this scope, in creation order. Disposed in reverse on Dispose().
         private readonly List<IDisposable> _disposables = new List<IDisposable>();
 
         // Per-thread set of implementation types currently being resolved on this scope's call chain.
         // Catches cycles the registration-time validator missed (e.g., factory-introduced cycles)
-        private readonly ThreadLocal<HashSet<Type>> _resolutionStack =
-            new ThreadLocal<HashSet<Type>>(() => new HashSet<Type>());
+        private readonly ThreadLocal<HashSet<Type>> _resolutionStack = new ThreadLocal<HashSet<Type>>(() => new HashSet<Type>());
 
         private readonly object _lock = new object();
-        private bool _disposed;
 
         // Singleton caches live only on the root scope; child scopes route Singleton lookups via Root. The first holds
         // implementation instances keyed by primary entry, the second decorated results keyed by alias entry.
@@ -53,20 +56,42 @@ namespace Didionysymus.Lattice.Runtime.Internal
         // reverse of disposal order.
         private readonly List<object> _creationOrder = new List<object>();
 
-        // Where this scope is in its lifecycle. Read and written under _lock.
-        private LifecycleState _state = LifecycleState.Created;
+        // Where this scope is in its lifecycle. Written only under _lock. Volatile because the fast-path disposal checks
+        // (ThrowIfDisposed on the public surface) read it without the lock; every decision that depends on it, such as
+        // a tracking add or a lifecycle entry, re-reads it under _lock.
+        private volatile LifecycleState _state = LifecycleState.Created;
 
         // The exception that faulted this scope; quoted by every later refused call.
         private Exception _fault;
         
-        // The cancellation source of the running startup, linked to the caller's token; Dispose cancels it. Null when
-        // no startup is running. Read and written under _lock.
-        private CancellationTokenSource _startupCancellation;
+        // The token source startup participants receive. Created by BeginStart and owned by this scope, not linked: the
+        // caller's token reaches it only through _callerRegistration while startup runs. ShutdownAsync and Dispose
+        // cancel it; only Dispose disposes it. Null before startup and after disposal. Read and written under _lock.
+        private CancellationTokenSource _participantCancellation;
+
+        // The caller token's registration that cancels _participantCancellation while startup runs. Removed when the
+        // startup loop ends or by Dispose, whichever comes first; default when there is none. Read and written under
+        // _lock.
+        private CancellationTokenRegistration _callerRegistration;
+
+        // Completed, never faulted, once the startup loop has left its finally; what ShutdownAsync waits for. Created by
+        // BeginStart with RunContinuationsAsynchronously, so completing it never runs a waiter inline. Null before
+        // startup. Read and written under _lock.
+        private TaskCompletionSource<bool> _startupSettled;
+
+        // Completed once the Dispose that latched has run every step; what a ShutdownAsync awaits when another caller
+        // disposed this scope. Created with the scope, so it is always there to await.
+        private readonly TaskCompletionSource<bool> _disposalCompleted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         // Children registered against this scope; populated by their constructors and drained on Dispose (cascade). Walked
         // by DiagnosticsExtensions.DumpScopeTree to prin the scope tree root-down
         private readonly List<Scope> _children = new List<Scope>();
 
+        // The scope whose startup loop is awaiting a StartAsync on this logical call chain. Set before each await, so it
+        // flows into the participant and whatever it starts; the async method's own execution context keeps it from
+        // reaching the caller. Read by ShutdownAsync to refuse a shutdown that would wait on itself.
+        private static readonly AsyncLocal<Scope> _runningStartup = new AsyncLocal<Scope>();
+        
         // Process-static monotonic counter that mints a fresh ScopeID for every Scope instance. Scope IDs
         // vary between processes; they exist for diagnostics dump output, not for cross-process identity.
         private static int _nextScopeID;
@@ -99,8 +124,8 @@ namespace Didionysymus.Lattice.Runtime.Internal
         internal int ScopeID { get; } = Interlocked.Increment(ref _nextScopeID);
         
         /// <summary>
-        /// Where this scope is in its lifecycle: created, running its initialization pass, initialized, or faulted
-        /// by a failed pass.
+        /// Where this scope is in its lifecycle: created, running its initialization pass, initialized, starting, ready,
+        /// faulted by a failed pass or startup, stopping while a shutdown waits for running startup work, or disposed.
         /// </summary>
         internal LifecycleState State
         {
@@ -110,6 +135,22 @@ namespace Didionysymus.Lattice.Runtime.Internal
                 {
                     return _state;
                 }
+            }
+        }
+        
+        /// <summary>
+        /// Reads this scope's state and the exception that faulted it together, under <c>_lock</c>, so a child's
+        /// refusal quotes the fault of the very state it saw. Called by a child under its own lock, in the
+        /// child-then-parent order.
+        /// </summary>
+        /// <param name="fault">Receives the exception that faulted this scope, or null when it was never faulted.</param>
+        /// <returns>This scope's state.</returns>
+        internal LifecycleState ReadState(out Exception fault)
+        {
+            lock (_lock)
+            {
+                fault = _fault;
+                return _state;
             }
         }
 
@@ -129,11 +170,13 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
             if (parent == null) return;
 
-            // Register with parent so the parent's Dispose can cascade.
-            // Lock the parent's _lock to keep _children mutation thread-safe (parents
-            // may be alive on another thread when a child is constructed).
+            // Register with the parent so the parent's Dispose can cascade, under the parent's lock: the parent's
+            // Dispose latches and snapshots its children under the same lock, so this child is either in that snapshot
+            // or refused here, never added to a parent whose cascade has passed.
             lock (parent._lock)
             {
+                if (parent._state == LifecycleState.Disposed) throw new ObjectDisposedException(nameof(Scope));
+
                 parent._children.Add(this);
             }
         }
@@ -235,6 +278,47 @@ namespace Didionysymus.Lattice.Runtime.Internal
             if (instance == null) throw new ArgumentNullException(nameof(instance));
 
             InjectInternal(instance);
+        }
+        
+        /// <summary>
+        /// Returns whether this scope still holds <paramref name="instance"/> in any of its tracking structures: either
+        /// Scoped cache, the root's two Singleton caches, the creation order, the initialized set or the disposal list.
+        /// Compares by reference. The registry, and so a <c>RegisterInstance</c> value, is not consulted. A test seam:
+        /// retention is not observable through the public API.
+        /// </summary>
+        /// <param name="instance">The object to look for.</param>
+        /// <returns>True when any tracking structure of this scope holds <paramref name="instance"/>.</returns>
+        internal bool IsTracking(object instance)
+        {
+            lock (_lock)
+            {
+                if (ContainsReference(_scopedCache.Values, instance)) return true;
+                if (ContainsReference(_scopedDecoratedCache.Values, instance)) return true;
+
+                if (_singletonCache != null && ContainsReference(_singletonCache.Values, instance)) return true;
+                if (_singletonDecoratedCache != null && ContainsReference(_singletonDecoratedCache.Values, instance)) return true;
+
+                if (ContainsReference(_creationOrder, instance)) return true;
+                if (_initialized.Contains(instance)) return true;
+
+                return ContainsReference(_disposables, instance);
+            }
+        }
+        
+        /// <summary>
+        /// Returns whether <paramref name="items"/> holds <paramref name="instance"/> itself, compared by reference.
+        /// </summary>
+        /// <param name="items">The structure to search.</param>
+        /// <param name="instance">The object to look for.</param>
+        /// <returns>True when an item is the same object as <paramref name="instance"/>.</returns>
+        private static bool ContainsReference(IEnumerable<object> items, object instance)
+        {
+            foreach (object item in items)
+            {
+                if (ReferenceEquals(item, instance)) return true;
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -375,6 +459,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
         /// <returns>An instance of the service described by the registration entry.</returns>
         /// <exception cref="CyclicDependencyException">Thrown when a cyclic dependency is detected while resolving the service instance.</exception>
         /// <exception cref="InvalidOperationException">Thrown when the service has an unknown or unsupported lifetime configuration.</exception>
+        /// <exception cref="ObjectDisposedException">Thrown when the scope that owns or tracks the object was disposed before or while it was built; an object built meanwhile was disposed.</exception>
         internal object MaterializeFromEntry(RegistrationEntry entry, Scope requestingScope)
         {
             // Pre-built singletons (RegisterInstance) bypass activation, caching, and disposal tracking
@@ -406,7 +491,12 @@ namespace Didionysymus.Lattice.Runtime.Internal
                         Scope rootScope = Root;
                         lock (rootScope._lock)
                         {
+                            // Dispose latches and snapshots under this lock: an activation that begins after the
+                            // latch builds nothing.
+                            rootScope.ThrowIfDisposed();
+
                             return GetOrCreateCached(
+                                rootScope,
                                 entry,
                                 rootScope._singletonCache,
                                 rootScope._singletonDecoratedCache,
@@ -426,7 +516,10 @@ namespace Didionysymus.Lattice.Runtime.Internal
                         // locks during activation are only ever this scope's or an ancestor's.
                         lock (_lock)
                         {
+                            ThrowIfDisposed();
+
                             return GetOrCreateCached(
+                                this,
                                 entry,
                                 _scopedCache,
                                 _scopedDecoratedCache,
@@ -438,18 +531,22 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
                     case Lifetime.Transient:
                     {
-                        object created = WrapDecorators(entry, entry.Activator(requestingScope));
-
-                        // Per planning decision: only IDisposable transients are tracked,
-                        // attributed to the scope that requested them
-                        if (created is IDisposable disposable)
+                        object inner = entry.Activator(requestingScope);
+                        List<object> built = HasDecorators(entry) ? new List<object>() : null;
+                        object created;
+                        try
                         {
-                            lock (requestingScope._lock)
-                            {
-                                requestingScope._disposables.Add(disposable);
-                            }
+                            created = WrapDecorators(entry, inner, built);
+                        }
+                        catch
+                        {
+                            // The inner instance and the links built before the failure belong to the requesting scope
+                            // all the same.
+                            TrackTransient(requestingScope, inner, built);
+                            throw;
                         }
 
+                        TrackTransient(requestingScope, inner, built);
                         return created;
                     }
 
@@ -460,6 +557,58 @@ namespace Didionysymus.Lattice.Runtime.Internal
             {
                 stack.Remove(entry.ImplType);
             }
+        }
+        
+        /// <summary>
+        /// Tracks what a Transient resolve built for disposal by the scope that requested it: the inner instance, then
+        /// each decorator in build order, each only when it is <see cref="IDisposable"/>. A resolve that built nothing
+        /// disposable takes no lock. When the requesting scope's disposal has begun, nothing is added: the objects are
+        /// disposed outside the lock, last built first, and the resolve fails.
+        /// </summary>
+        /// <param name="requestingScope">The scope the public resolve was called on.</param>
+        /// <param name="inner">The implementation instance.</param>
+        /// <param name="built">The decorators built around it, in build order, or null when the service has none.</param>
+        /// <exception cref="ObjectDisposedException">Thrown when <paramref name="requestingScope"/> was disposed while the objects were built; they were disposed.</exception>
+        private void TrackTransient(Scope requestingScope, object inner, List<object> built)
+        {
+            // Only disposable objects are tracked, by the scope that requested the resolve.
+            bool ownsDisposable = inner is IDisposable;
+            if (built != null)
+            {
+                for (int i = 0; i < built.Count; i++)
+                {
+                    if (built[i] is IDisposable) ownsDisposable = true;
+                }
+            }
+
+            if (!ownsDisposable) return;
+
+            bool refused;
+            lock (requestingScope._lock)
+            {
+                refused = requestingScope._state == LifecycleState.Disposed;
+                if (!refused)
+                {
+                    if (inner is IDisposable innerDisposable) requestingScope._disposables.Add(innerDisposable);
+
+                    if (built != null)
+                    {
+                        for (int i = 0; i < built.Count; i++)
+                        {
+                            if (built[i] is IDisposable linkDisposable) requestingScope._disposables.Add(linkDisposable);
+                        }
+                    }
+                }
+            }
+
+            if (!refused) return;
+
+            // The requesting scope's disposal began while these objects were built and has already taken its snapshot:
+            // dispose them here, outside the lock, and fail the resolve.
+            List<object> refusedObjects = new List<object> { inner };
+            if (built != null) refusedObjects.AddRange(built);
+
+            throw DisposeRefusedObjects(refusedObjects);
         }
 
         /// <summary>
@@ -500,13 +649,16 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
         /// <summary>
         /// Applies the decorator chain registered in this scope for <paramref name="entry"/>'s service type to
-        /// <paramref name="inner"/>, first registered innermost. Returns <paramref name="inner"/> itself when the
-        /// service type has no decorators here.
+        /// <paramref name="inner"/>, first registered innermost, and adds each decorator to <paramref name="built"/> as
+        /// soon as it is built, so the caller can track every link of the chain. Returns <paramref name="inner"/>
+        /// itself when the service type has no decorators here. When a decorator throws, <paramref name="built"/> holds
+        /// the links built before it.
         /// </summary>
         /// <param name="entry">The entry being resolved; its service type selects the decorator chain.</param>
         /// <param name="inner">The built implementation instance to wrap.</param>
+        /// <param name="built">Receives each decorator in build order, innermost first; null when the caller tracks none.</param>
         /// <returns>The outermost decorator, or <paramref name="inner"/> when no decorators are registered.</returns>
-        private object WrapDecorators(RegistrationEntry entry, object inner)
+        private object WrapDecorators(RegistrationEntry entry, object inner, List<object> built)
         {
             // Decorators apply only at the scope where they were registered
             if (!_registry.DecoratorChains.TryGetValue(entry.ServiceType, out List<DecoratorEntry> decorators)
@@ -520,9 +672,21 @@ namespace Didionysymus.Lattice.Runtime.Internal
             for (int i = 0; i < decorators.Count; i++)
             {
                 current = BuildDecorator(decorators[i], current);
+                built?.Add(current);
             }
 
             return current;
+        }
+        
+        /// <summary>
+        /// Returns whether this scope registers a non-empty decorator chain for <paramref name="entry"/>'s service type,
+        /// so a caller allocates a list for the chain's links only when there are links to hold.
+        /// </summary>
+        /// <param name="entry">The entry being resolved.</param>
+        /// <returns>True when at least one decorator applies to the entry in this scope.</returns>
+        private bool HasDecorators(RegistrationEntry entry)
+        {
+            return _registry.DecoratorChains.TryGetValue(entry.ServiceType, out List<DecoratorEntry> decorators) && decorators.Count > 0;
         }
 
         /// <summary>
@@ -552,21 +716,29 @@ namespace Didionysymus.Lattice.Runtime.Internal
         /// Returns the cached result for <paramref name="entry"/>, building what is missing. The registration's
         /// implementation instance is built by and cached once under <see cref="RegistrationEntry.Primary"/>, so every
         /// alias shares it whichever alias is resolved first; an alias whose service type has a decorator chain in
-        /// this scope gets that chain built once around the shared instance and cached under the alias entry. Each
-        /// object is tracked for disposal and appended to the creation order when created, the shared instance
-        /// before any wrapper, so initialization visits the inner object first and reverse-order disposal releases
-        /// the wrapper first. The caller holds the lock of the scope that owns the caches.
+        /// this scope gets that chain built once around the shared instance and cached under the alias entry. Every
+        /// object of the chain is owned: the shared instance is tracked for disposal and appended to the creation order
+        /// when created, then each decorator, innermost first, once the whole chain is built, so the pass initializes
+        /// and startup starts the chain from the inside out and reverse-order disposal releases it outermost first.
+        /// When a decorator throws, the links built before it are tracked for disposal only, never initialized or
+        /// started, and the exception propagates. The caller holds the lock of <paramref name="owner"/>. A factory,
+        /// constructor or decorator that disposes <paramref name="owner"/> does so on this thread inside that lock, so
+        /// the state is re-read before each add: once <paramref name="owner"/> is disposed nothing is added, what this
+        /// activation built is disposed, and the resolve fails.
         /// </summary>
+        /// <param name="owner">The scope that owns both caches and both lists; its lock is held.</param>
         /// <param name="entry">The alias entry being resolved; it belongs to this scope's registry.</param>
         /// <param name="instanceCache">The implementation cache, keyed by primary entry.</param>
         /// <param name="decoratedCache">The decorated-result cache, keyed by alias entry.</param>
-        /// <param name="disposables">The disposal list of the scope that owns both caches.</param>
-        /// <param name="creationOrder">The creation-order list of the scope that owns both caches.</param>
+        /// <param name="disposables">The disposal list of <paramref name="owner"/>.</param>
+        /// <param name="creationOrder">The creation-order list of <paramref name="owner"/>.</param>
         /// <returns>
         /// The decorated result for <paramref name="entry"/>, or the shared instance when its service type has no
         /// decorators.
         /// </returns>
+        /// <exception cref="ObjectDisposedException">Thrown when <paramref name="owner"/> was disposed while this activation built an object; what it built was disposed.</exception>
         private object GetOrCreateCached(
+            Scope owner,
             RegistrationEntry entry,
             Dictionary<RegistrationEntry, object> instanceCache,
             Dictionary<RegistrationEntry, object> decoratedCache,
@@ -580,19 +752,49 @@ namespace Didionysymus.Lattice.Runtime.Internal
             if (!instanceCache.TryGetValue(primary, out object instance))
             {
                 instance = primary.Activator(this);
+                if (owner._state == LifecycleState.Disposed) throw DisposeRefusedObjects(new[] { instance });
+
                 instanceCache[primary] = instance;
                 creationOrder.Add(instance);
 
                 if (instance is IDisposable disposable) disposables.Add(disposable);
             }
 
-            object wrapped = WrapDecorators(entry, instance);
-            if (ReferenceEquals(wrapped, instance)) return instance;
+            if (!HasDecorators(entry)) return instance;
+
+            List<object> built = new List<object>();
+            object wrapped;
+            try
+            {
+                wrapped = WrapDecorators(entry, instance, built);
+            }
+            catch
+            {
+                // The links built before the failure are owned all the same: disposed with the scope, never initialized
+                // or started. A scope disposed meanwhile takes none of them, so they are disposed here.
+                if (owner._state == LifecycleState.Disposed)
+                {
+                    DisposeRefusedObjects(built);
+                    throw;
+                }
+
+                for (int i = 0; i < built.Count; i++)
+                {
+                    if (built[i] is IDisposable builtDisposable) disposables.Add(builtDisposable);
+                }
+
+                throw;
+            }
+
+            if (owner._state == LifecycleState.Disposed) throw DisposeRefusedObjects(built);
 
             decoratedCache[entry] = wrapped;
-            creationOrder.Add(wrapped);
+            for (int i = 0; i < built.Count; i++)
+            {
+                creationOrder.Add(built[i]);
 
-            if (wrapped is IDisposable wrappedDisposable) disposables.Add(wrappedDisposable);
+                if (built[i] is IDisposable linkDisposable) disposables.Add(linkDisposable);
+            }
 
             return wrapped;
         }
@@ -655,9 +857,9 @@ namespace Didionysymus.Lattice.Runtime.Internal
         /// Once startup has begun, the pass initializes nothing: it returns when no cached initializable is pending and
         /// throws when one created since is, so the caller initializes it with <see cref="InitializeInstance"/>.
         /// </summary>
-        /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed.</exception>
+        /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed, before or during the pass; a pass that observes the disposal stops before the next participant.</exception>
         /// <exception cref="InvalidOperationException">
-        /// Thrown when a pass is already running on this scope, when this scope is faulted, when the parent scope has not completed its pass,
+        /// Thrown when this scope is shutting down, when a pass is already running on this scope, when this scope is faulted, when the parent scope has not completed its pass,
         /// or, once startup has begun, when a cached initializable created since is not initialized.
         /// </exception>
         /// <exception cref="LifecycleException">Thrown when a participant's <c>Initialize</c> throws; this scope is then faulted.</exception>
@@ -699,7 +901,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
         /// <returns>True when <see cref="IInitializable.Initialize"/> ran; false when <paramref name="instance"/> is not <see cref="IInitializable"/> or this scope already initialized it.</returns>
         /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed.</exception>
         /// <exception cref="ArgumentNullException">Thrown when <paramref name="instance"/> is null.</exception>
-        /// <exception cref="InvalidOperationException">Thrown when this scope has not completed its pass, is running one, or is faulted.</exception>
+        /// <exception cref="InvalidOperationException">Thrown when this scope is shutting down, has not completed its pass, is running one, or is faulted.</exception>
         /// <exception cref="LifecycleException">Thrown when the object's <c>Initialize</c> throws; this scope is then faulted.</exception>
         internal bool InitializeInstance(object instance)
         {
@@ -708,6 +910,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
             lock (_lock)
             {
+                ThrowIfStoppingOrDisposed();
                 ThrowIfFaultedOrInitializing();
 
                 if (_state == LifecycleState.Created)
@@ -743,18 +946,20 @@ namespace Didionysymus.Lattice.Runtime.Internal
         }
 
         /// <summary>
-        /// Moves this scope into <see cref="LifecycleState.Initializing"/> after checking that no pass is running,
-        /// that this scope is not faulted, and that the parent, if any, has completed its own pass. The parent's state
-        /// is read under the parent's lock, in the child-then-parent order <see cref="Dispose"/> already uses. Once
-        /// startup has begun, the pass has nothing to build or initialize: the state stays as it is, and a cached
-        /// initializable created since is reported instead.
+        /// Moves this scope into <see cref="LifecycleState.Initializing"/> after checking that it is neither stopping
+        /// nor disposed, that no pass is running, that this scope is not faulted, and that the parent, if any, has
+        /// completed its own pass. The parent's state is read under the parent's lock, in the child-then-parent order
+        /// <see cref="Dispose"/> already uses. Once startup has begun, the pass has nothing to build or initialize: the
+        /// state stays as it is, and a cached initializable created since is reported instead.
         /// </summary>
         /// <returns>True when the pass runs; false when startup has begun and nothing is pending.</returns>
-        /// <exception cref="InvalidOperationException">Thrown when a pass is already running, when this scope is faulted, when the parent has not completed its pass, or, once startup has begun, when a cached initializable is pending.</exception>
+        /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed.</exception>
+        /// <exception cref="InvalidOperationException">Thrown when this scope is shutting down, when a pass is already running, when this scope is faulted, when the parent has not completed its pass (a stopping or disposed parent included), or, once startup has begun, when a cached initializable is pending.</exception>
         private bool BeginPass()
         {
             lock (_lock)
             {
+                ThrowIfStoppingOrDisposed();
                 ThrowIfFaultedOrInitializing();
 
                 if (_state == LifecycleState.Starting || _state == LifecycleState.Ready)
@@ -765,7 +970,15 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
                 if (_parent != null)
                 {
-                    LifecycleState parentState = _parent.State;
+                    LifecycleState parentState = _parent.ReadState(out Exception parentFault);
+                    if (parentState == LifecycleState.Faulted)
+                    {
+                        throw new InvalidOperationException(
+                            $"The parent scope is faulted and must be disposed and rebuilt: {parentFault.Message}",
+                            parentFault
+                        );
+                    }
+
                     if (!HasCompletedPass(parentState))
                     {
                         throw new InvalidOperationException(
@@ -792,7 +1005,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
                 if (candidate is not IInitializable || _initialized.Contains(candidate)) continue;
 
                 throw new InvalidOperationException(
-                    $"'{candidate.GetType().FullName}' was created after startup began on this scope and is not " +
+                    $"'{candidate.GetType().FullName}' was created after the last initialization pass and is not " +
                     "initialized; once startup has begun the pass initializes nothing, so initialize it with " +
                     "InitializeInstance."
                 );
@@ -921,12 +1134,21 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
         /// <summary>
         /// Calls <see cref="IInitializable.Initialize"/> on <paramref name="target"/> outside the lock and records it
-        /// as initialized only once the call returned.
+        /// as initialized only once the call returned. Refuses first, under the lock, when this scope is stopping or
+        /// disposed, so a pass that observes a shutdown or disposal stops before this participant. An
+        /// <c>Initialize</c> body that disposed this scope leaves nothing recorded.
         /// </summary>
         /// <param name="target">An <see cref="IInitializable"/> this scope owns.</param>
+        /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed.</exception>
+        /// <exception cref="InvalidOperationException">Thrown when this scope is shutting down.</exception>
         /// <exception cref="LifecycleException">Thrown, wrapping the hook's exception, when <c>Initialize</c> throws.</exception>
         private void InitializeTarget(object target)
         {
+            lock (_lock)
+            {
+                ThrowIfStoppingOrDisposed();
+            }
+
             try
             {
                 ((IInitializable)target).Initialize();
@@ -938,24 +1160,26 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
             lock (_lock)
             {
-                _initialized.Add(target);
+                if (_state != LifecycleState.Disposed) _initialized.Add(target);
             }
         }
 
         /// <summary>
-        /// Marks this scope faulted with the exception that ended its pass, a supplied object's initialization or its
-        /// startup, so every later lifecycle call is refused with that exception quoted. The first fault is kept: a
-        /// scope that is already faulted is left as it is.
+        /// Records the exception that ended this scope's pass, a supplied object's initialization or its startup, and
+        /// marks a live scope faulted, so every later lifecycle call is refused with that exception quoted. The first
+        /// fault is kept: a later one is not recorded. A scope that is stopping or disposed records the first fault
+        /// too but keeps its state, because disposal is the only way on from there.
         /// </summary>
         /// <param name="exception">The exception that faulted this scope.</param>
         private void Fault(Exception exception)
         {
             lock (_lock)
             {
-                if (_state == LifecycleState.Faulted) return;
+                _fault ??= exception;
+
+                if (_state is LifecycleState.Faulted or LifecycleState.Stopping or LifecycleState.Disposed) return;
 
                 _state = LifecycleState.Faulted;
-                _fault = exception;
             }
         }
 
@@ -963,21 +1187,23 @@ namespace Didionysymus.Lattice.Runtime.Internal
         /// Runs this scope's startup once: starts every <see cref="IAsyncStartable"/> this scope has cached, once each
         /// by reference, in creation order, awaiting each <c>StartAsync</c> before calling the next, then moves this
         /// scope to <see cref="LifecycleState.Ready"/>. Builds nothing: the initialization pass built the participants.
-        /// Participants receive a token linked to <paramref name="cancellationToken"/> that <see cref="Dispose"/> also
-        /// cancels; the token and disposal are checked before each participant and before this scope becomes ready.
-        /// Continues on the caller's synchronization context between participants, so a caller on a main thread keeps
-        /// every <c>StartAsync</c> call on that thread. A call on a ready scope starts nothing.
+        /// Participants receive a token this scope owns, which lives until disposal: <paramref name="cancellationToken"/>
+        /// cancels it only while startup runs, and <c>ShutdownAsync</c> and <see cref="Dispose"/> cancel it at any time
+        /// until then. The token, a shutdown and disposal are checked before each participant and before this scope
+        /// becomes ready. Continues on the caller's synchronization context between participants, so a caller on a main
+        /// thread keeps every <c>StartAsync</c> call on that thread. A call on a ready scope starts nothing. When the
+        /// loop ends, however it ends, it signals that startup has settled, which is what <c>ShutdownAsync</c> waits for.
         /// </summary>
-        /// <param name="cancellationToken">Cancels startup before or between participants; linked into the token each participant receives.</param>
+        /// <param name="cancellationToken">Cancels startup before or between participants; while startup runs it also cancels the token participants receive.</param>
         /// <returns>A task that completes when every participant has started and this scope is ready.</returns>
         /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed before startup began.</exception>
         /// <exception cref="OperationCanceledException">
-        /// Thrown when the token is cancelled or this scope is disposed; once startup has begun, this scope is then
-        /// faulted.
+        /// Thrown when the token is cancelled or this scope is shut down or disposed; once startup has begun, a scope
+        /// that was not shut down or disposed is then faulted.
         /// </exception>
         /// <exception cref="InvalidOperationException">
-        /// Thrown when startup is already running, when this scope is faulted or has not completed its pass, when a
-        /// cached participant is not initialized, or when the parent is not ready.
+        /// Thrown when this scope is shutting down, when startup is already running, when this scope is faulted or has
+        /// not completed its pass, when a cached participant is not initialized, or when the parent is not ready.
         /// </exception>
         /// <exception cref="LifecycleException">Thrown when a participant's <c>StartAsync</c> throws, returns a faulted task or returns no task; this scope is then faulted.</exception>
         internal async Task RunAsyncStartablesAsync(CancellationToken cancellationToken)
@@ -996,6 +1222,9 @@ namespace Didionysymus.Lattice.Runtime.Internal
                     object target = targets[i];
                     try
                     {
+                        // A ShutdownAsync the participant calls on this scope, or on an ancestor, would wait for this
+                        // very loop; the marker lets it refuse instead.
+                        _runningStartup.Value = this;
                         await ((IAsyncStartable)target).StartAsync(startupToken);
                     }
                     catch (Exception exception)
@@ -1016,7 +1245,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
             }
             finally
             {
-                ReleaseStartupCancellation();
+                ReleaseStartup();
             }
         }
 
@@ -1054,19 +1283,25 @@ namespace Didionysymus.Lattice.Runtime.Internal
             return targets;
         }
         
-        /// <summary>
-        /// Moves this scope into <see cref="LifecycleState.Starting"/> after its checks, in this order: not disposed;
-        /// already ready (returns null, nothing to start); not faulted; not already starting; token not cancelled (no
-        /// state change); pass completed; parent, if any, ready (read under the parent's lock, child-then-parent).
-        /// Then snapshots the participants and creates the linked cancellation source.
+                /// <summary>
+        /// Moves this scope into <see cref="LifecycleState.Starting"/> after its checks, in this order: neither
+        /// stopping nor disposed (so a scope being shut down never reports that it has nothing to start); already
+        /// ready (returns null, nothing to start); not faulted; not already starting; token not cancelled (no state
+        /// change); pass completed; parent, if any, ready (read under the parent's lock, child-then-parent). Then
+        /// snapshots the participants and creates, all or nothing, the cancellation source they receive, the caller
+        /// token's registration that cancels it, and the settle signal: when any call throws, this scope is left as it
+        /// was.
         /// </summary>
         /// <param name="cancellationToken">The caller's token.</param>
-        /// <param name="startupToken">Receives the linked token participants are given; <see cref="CancellationToken.None"/> when null is returned.</param>
+        /// <param name="startupToken">Receives the token participants are given; <see cref="CancellationToken.None"/> when null is returned.</param>
         /// <returns>The participants to start, in order, or null when this scope is already ready.</returns>
-        /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed.</exception>
+        /// <exception cref="ObjectDisposedException">
+        /// Thrown when this scope has been disposed, or, on some runtimes, when the source of
+        /// <paramref name="cancellationToken"/> was disposed by the caller.
+        /// </exception>
         /// <exception cref="OperationCanceledException">Thrown when <paramref name="cancellationToken"/> is already cancelled.</exception>
         /// <exception cref="InvalidOperationException">
-        /// Thrown when this scope is faulted, already starting, has not completed its pass, holds an uninitialized participant, or
+        /// Thrown when this scope is shutting down, is faulted, already starting, has not completed its pass, holds an uninitialized participant, or
         /// when the parent is not ready.
         /// </exception>
         private List<object> BeginStart(CancellationToken cancellationToken, out CancellationToken startupToken)
@@ -1075,7 +1310,7 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
             lock (_lock)
             {
-                ThrowIfDisposed();
+                ThrowIfStoppingOrDisposed();
 
                 if (_state == LifecycleState.Ready) return null;
 
@@ -1100,18 +1335,57 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
                 if (_parent != null)
                 {
-                    LifecycleState parentState = _parent.State;
+                    LifecycleState parentState = _parent.ReadState(out Exception parentFault);
+                    if (parentState == LifecycleState.Faulted)
+                    {
+                        throw new InvalidOperationException(
+                            $"The parent scope is faulted and must be disposed and rebuilt: {parentFault.Message}",
+                            parentFault
+                        );
+                    }
+
                     if (parentState != LifecycleState.Ready)
                     {
                         throw new InvalidOperationException(
-                           $"Run RunAsyncStartablesAsync on the parent scope before the child: the parent's state is {parentState}."
+                            $"Run RunAsyncStartablesAsync on the parent scope before the child: the parent's state is {parentState}."
                         );
                     }
                 }
 
                 List<object> targets = CollectStartTargets();
-                _startupCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                startupToken = _startupCancellation.Token;
+
+                // Build in locals and assign only once every call that can throw has returned: Register throws on some
+                // runtimes for a token whose source the caller disposed, and a settle signal that no loop completes
+                // would hang ShutdownAsync.
+                CancellationTokenSource participantCancellation = new CancellationTokenSource();
+                CancellationTokenRegistration callerRegistration = default;
+                if (cancellationToken.CanBeCanceled)
+                {
+                    try
+                    {
+                        callerRegistration = cancellationToken.Register(static state =>
+                        {
+                            try
+                            {
+                                ((CancellationTokenSource)state).Cancel();
+                            }
+                            catch (ObjectDisposedException)
+                            {
+                                // Dispose cancelled and disposed the source while this callback was already running.
+                            }
+                        }, participantCancellation);
+                    }
+                    catch
+                    {
+                        participantCancellation.Dispose();
+                        throw;
+                    }
+                }
+
+                _participantCancellation = participantCancellation;
+                _callerRegistration = callerRegistration;
+                _startupSettled = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                startupToken = participantCancellation.Token;
                 _state = LifecycleState.Starting;
 
                 return targets;
@@ -1120,31 +1394,32 @@ namespace Didionysymus.Lattice.Runtime.Internal
 
         /// <summary>
         /// Stops startup before the next participant, or before this scope becomes ready, when this scope faulted
-        /// meanwhile, when the startup token is cancelled, or when <see cref="Dispose"/> has begun. Reads
-        /// <c>_disposed</c> under <c>_lock</c>, so a disposal that latched but has not yet cancelled the token still
-        /// stops startup.
+        /// meanwhile, when the startup token is cancelled, or when a shutdown or <see cref="Dispose"/> has begun. Reads
+        /// the state under <c>_lock</c>, so a shutdown or disposal that latched but has not yet cancelled the token
+        /// still stops startup.
         /// </summary>
-        /// <param name="startupToken">The linked token participants receive.</param>
+        /// <param name="startupToken">The token participants receive.</param>
         /// <exception cref="InvalidOperationException">Thrown when this scope is faulted.</exception>
-        /// <exception cref="OperationCanceledException">Thrown when the token is cancelled or this scope is being disposed.</exception>
+        /// <exception cref="OperationCanceledException">Thrown when the token is cancelled or this scope is stopping or disposed.</exception>
         private void ThrowIfStartupStopped(CancellationToken startupToken)
         {
             lock (_lock)
             {
                 ThrowIfFaulted();
 
-                if (_disposed || startupToken.IsCancellationRequested) throw new OperationCanceledException(startupToken);
+                bool stopped = _state is LifecycleState.Stopping or LifecycleState.Disposed;
+                if (stopped || startupToken.IsCancellationRequested) throw new OperationCanceledException(startupToken);
             }
         }
 
         /// <summary>
         /// Moves this scope from <see cref="LifecycleState.Starting"/> to <see cref="LifecycleState.Ready"/> after the
-        /// last participant, under the same lock as the final stop check, so a scope that faulted, was cancelled or is
-        /// being disposed never becomes ready.
+        /// last participant, under the same lock as the final stop check, so a scope that faulted, was cancelled, or is
+        /// stopping or disposed never becomes ready.
         /// </summary>
-        /// <param name="startupToken">The linked token participants received.</param>
+        /// <param name="startupToken">The token participants received.</param>
         /// <exception cref="InvalidOperationException">Thrown when this scope is faulted.</exception>
-        /// <exception cref="OperationCanceledException">Thrown when the token is cancelled or this scope is being disposed.</exception>
+        /// <exception cref="OperationCanceledException">Thrown when the token is cancelled or this scope is stopping or disposed.</exception>
         private void CompleteStart(CancellationToken startupToken)
         {
             lock (_lock)
@@ -1155,58 +1430,250 @@ namespace Didionysymus.Lattice.Runtime.Internal
         }
 
         /// <summary>
-        /// Detaches the running startup's cancellation source under <c>_lock</c> and disposes it outside the lock. A
-        /// <see cref="Dispose"/> that read the source before it was detached may still cancel it and catches the
-        /// resulting <see cref="ObjectDisposedException"/>.
+        /// Ends the running startup's hold on the caller's token and signals that startup has settled: takes the caller
+        /// registration under <c>_lock</c> unless <see cref="Dispose"/> already took it, removes it outside the lock,
+        /// then completes the settle signal. The participant source stays alive until <see cref="Dispose"/>. Removing
+        /// the registration waits only when its callback is running on another thread at that moment.
         /// </summary>
-        private void ReleaseStartupCancellation()
+        private void ReleaseStartup()
         {
-            CancellationTokenSource source;
+            CancellationTokenRegistration callerRegistration;
+            TaskCompletionSource<bool> settled;
             lock (_lock)
             {
-                source = _startupCancellation;
-                _startupCancellation = null;
+                callerRegistration = _callerRegistration;
+                _callerRegistration = default;
+                settled = _startupSettled;
             }
 
-            source?.Dispose();
+            callerRegistration.Dispose();
+            settled.TrySetResult(true);
         }
 
         /// <summary>
-        /// Disposes of all resources associated with the current scope instance, releasing any objects
-        /// that were created during the lifetime of this scope. Cancels a running startup first, without waiting for
-        /// it, then disposes child scopes and this scope's instances in reverse order of creation, and prevents
-        /// further use of the scope.
+        /// Shuts this scope down in order, continuing on the caller's synchronization context: refuses a call made from
+        /// this scope's own running startup or a descendant's; on a disposed scope waits for that disposal to finish;
+        /// otherwise marks this scope and its descendants stopping, cancels their participant tokens, waits until every
+        /// startup running in the subtree has settled or <paramref name="cancellationToken"/> is cancelled, whichever is
+        /// first, then disposes this scope. A concurrent call joins the same shutdown; a disposal another caller
+        /// latched reports its failures to that caller, and this call completes once it has finished.
         /// </summary>
-        /// <exception cref="ObjectDisposedException">Thrown if operations are attempted on the scope after it has been disposed.</exception>
-        public void Dispose()
+        /// <param name="cancellationToken">Bounds the wait for running startup work; it never stops the disposal.</param>
+        /// <returns>A task that completes once this scope is disposed.</returns>
+        /// <exception cref="InvalidOperationException">Thrown, through the task and without changing any state, when called from inside a running startup of this scope or a descendant.</exception>
+        /// <exception cref="AggregateException">Thrown, through the task, when a cancellation callback or the disposal threw; the scope is disposed.</exception>
+        /// <exception cref="OperationCanceledException">Thrown, through the task, when <paramref name="cancellationToken"/> stopped the wait; the scope is disposed.</exception>
+        internal async Task ShutdownAsync(CancellationToken cancellationToken)
         {
-            CancellationTokenSource startup;
-            lock (_lock)
+            if (IsInsideOwnStartup())
             {
-                if (_disposed) return;
-                _disposed = true;
-                startup = _startupCancellation;
+                throw new InvalidOperationException(
+                    "ShutdownAsync cannot wait for a startup it is called from; call Dispose, or shut down from the " +
+                    "scope's owner."
+                );
             }
 
-            // Cancel a running startup before anything is disposed, outside the lock so participant callbacks never
-            // run under it. The source may have just been disposed by a startup that finished, or a token callback
-            // may throw; neither may stop disposal.
-            if (startup != null)
+            if (_state == LifecycleState.Disposed)
+            {
+                await _disposalCompleted.Task;
+                return;
+            }
+
+            List<CancellationTokenSource> sources = new List<CancellationTokenSource>();
+            List<Task> settles = new List<Task>();
+            BeginStopping(sources, settles);
+
+            // Cancel outside every lock. A callback's failure is reported. An ObjectDisposedException means a callback
+            // disposed the scope, and so this source, during this very call, which had already cancelled it.
+            List<Exception> failures = new List<Exception>();
+            for (int i = 0; i < sources.Count; i++)
             {
                 try
                 {
-                    startup.Cancel();
+                    sources[i].Cancel();
                 }
-                catch
+                catch (ObjectDisposedException)
                 {
-                    // Swallow and continue disposal
+                    // Cancelled before a callback's disposal disposed it.
+                }
+                catch (Exception exception)
+                {
+                    AddFailures(failures, exception);
                 }
             }
 
-            // Snapshot children under the lock; cascade Dispose() calls hapen outside the lock
-            // so a child's Dispose can re-enter via the parent's _lock when
-            // it removes itself from _children. Calling Dispose on an already-disposed
-            // child is a no-op (idempotent).
+            bool settled = await WaitForSettleAsync(settles, cancellationToken);
+
+            // A Dispose another caller latched first returns at once here; its failures went to that caller, and the
+            // await below waits for it to finish. When this call latched, the signal is already complete.
+            try
+            {
+                Dispose();
+            }
+            catch (AggregateException exception)
+            {
+                failures.AddRange(exception.InnerExceptions);
+            }
+
+            await _disposalCompleted.Task;
+
+            if (failures.Count > 0) throw new AggregateException(DisposalFailureMessage, failures);
+
+            if (!settled) throw new OperationCanceledException(cancellationToken);
+        }
+        
+        /// <summary>
+        /// Moves this scope and, recursively, its children to <see cref="LifecycleState.Stopping"/>, taking one lock at
+        /// a time: under each scope's lock it skips a disposed scope, marks a live one stopping (a faulted scope keeps
+        /// its state, which already refuses every lifecycle call), takes its participant token source and settle
+        /// signal, and snapshots its children, then releases that lock before visiting them. A scope already stopping
+        /// is joined: its source and signal are taken again, so a second shutdown waits for the same startups.
+        /// </summary>
+        /// <param name="sources">Receives each participant token source to cancel.</param>
+        /// <param name="settles">Receives each settle signal to wait for.</param>
+        private void BeginStopping(List<CancellationTokenSource> sources, List<Task> settles)
+        {
+            Scope[] children;
+            lock (_lock)
+            {
+                if (_state == LifecycleState.Disposed) return;
+
+                if (_state != LifecycleState.Faulted) _state = LifecycleState.Stopping;
+
+                if (_participantCancellation != null) sources.Add(_participantCancellation);
+                if (_startupSettled != null) settles.Add(_startupSettled.Task);
+
+                children = _children.ToArray();
+            }
+
+            for (int i = 0; i < children.Length; i++)
+            {
+                children[i].BeginStopping(sources, settles);
+            }
+        }
+
+        /// <summary>
+        /// Returns whether the calling code runs inside a startup of this scope, or of a descendant, that has not
+        /// settled, so a shutdown would wait on itself. Walks from the running-startup marker up the parent chain;
+        /// the marker also flows into work a participant started without awaiting it, which is refused the same way
+        /// until that startup settles.
+        /// </summary>
+        /// <returns>True when the marker names this scope or a descendant whose startup is still running.</returns>
+        private bool IsInsideOwnStartup()
+        {
+            Scope running = _runningStartup.Value;
+            for (Scope scope = running; scope != null; scope = scope._parent)
+            {
+                if (!ReferenceEquals(scope, this)) continue;
+
+                TaskCompletionSource<bool> settled;
+                lock (running._lock)
+                {
+                    settled = running._startupSettled;
+                }
+
+                return settled != null && !settled.Task.IsCompleted;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Waits until every settle signal in <paramref name="settles"/> has completed, or until
+        /// <paramref name="cancellationToken"/> is cancelled, whichever comes first, continuing on the caller's
+        /// synchronization context. Returns synchronously when there is nothing to wait for and when the token is
+        /// already cancelled, so a shutdown with a cancelled token disposes within the call. A token whose source the
+        /// caller disposed without cancelling it can never end the wait: when registering on it throws, the wait covers
+        /// the settle signals alone, so the shutdown still disposes.
+        /// </summary>
+        /// <param name="settles">The settle signals taken from the subtree; they complete and never fault.</param>
+        /// <param name="cancellationToken">Ends the wait early.</param>
+        /// <returns>True when every signal completed; false when the token ended the wait first.</returns>
+        private static async Task<bool> WaitForSettleAsync(List<Task> settles, CancellationToken cancellationToken)
+        {
+            if (settles.Count == 0) return true;
+
+            Task all = Task.WhenAll(settles);
+            if (all.IsCompleted) return true;
+
+            if (cancellationToken.IsCancellationRequested) return false;
+
+            if (!cancellationToken.CanBeCanceled)
+            {
+                await all;
+                return true;
+            }
+
+            TaskCompletionSource<bool> canceled = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            CancellationTokenRegistration registration;
+            try
+            {
+                registration = cancellationToken.Register(static state => ((TaskCompletionSource<bool>)state).TrySetResult(true), canceled);
+            }
+            catch (ObjectDisposedException)
+            {
+                // Some runtimes refuse to register on a token whose source the caller disposed; that token can never be
+                // cancelled, so only the settle signals end the wait.
+                await all;
+                return true;
+            }
+
+            try
+            {
+                Task first = await Task.WhenAny(all, canceled.Task);
+                return ReferenceEquals(first, all);
+            }
+            finally
+            {
+                registration.Dispose();
+            }
+        }
+        
+        /// <summary>
+        /// Disposes this scope and everything it owns, in order: detaches a running startup from the caller's token and
+        /// cancels the token startup participants receive, disposes child scopes (each its own subtree first), removes
+        /// this scope from its parent, disposes this scope's own disposables in reverse order of creation, then releases
+        /// every cache, tracking entry and internal resource. Every step runs whatever an earlier one threw, and the
+        /// failures are reported together afterwards. The scope is disposed either way, a second call does nothing, and
+        /// an object built after disposal began is disposed rather than tracked. Does not wait for running startup
+        /// work; <c>ShutdownAsync</c> does. The registry, and so every <c>RegisterInstance</c> value, is kept; nothing
+        /// the caller supplied is disposed.
+        /// </summary>
+        /// <exception cref="AggregateException">Thrown after every step ran, when a child scope's disposal, a tracked object's Dispose or a cancellation callback threw.</exception>
+        public void Dispose()
+        {
+            CancellationTokenSource participantCancellation;
+            CancellationTokenRegistration callerRegistration;
+            lock (_lock)
+            {
+                if (_state == LifecycleState.Disposed) return;
+
+                _state = LifecycleState.Disposed;
+                participantCancellation = _participantCancellation;
+                callerRegistration = _callerRegistration;
+                _callerRegistration = default;
+            }
+
+            List<Exception> failures = new List<Exception>();
+
+            // Detach the caller's token first, so its later cancellation never reaches the source this call disposes;
+            // then cancel the participants' token before anything is disposed, outside the lock so callbacks never run
+            // under it.
+            callerRegistration.Dispose();
+            if (participantCancellation != null)
+            {
+                try
+                {
+                    participantCancellation.Cancel();
+                }
+                catch (Exception exception)
+                {
+                    AddFailures(failures, exception);
+                }
+            }
+
+            // Snapshot children under the lock; each child's Dispose runs outside it, because a child re-enters this
+            // lock to remove itself. A child's aggregate contributes its inner exceptions, so the list stays flat.
             Scope[] childSnapshot;
             lock (_lock)
             {
@@ -1219,16 +1686,13 @@ namespace Didionysymus.Lattice.Runtime.Internal
                 {
                     childSnapshot[i].Dispose();
                 }
-                catch
+                catch (Exception exception)
                 {
-                    // Swallow per-child: do not let one failed child Dispose
-                    // block the rest of the cascade
+                    AddFailures(failures, exception);
                 }
             }
 
-            // Remove from parent's child list so a still-alive parent does not retain
-            // a reference to a disposed scope (helps the GDC). Parent may already be null
-            // on a root scope
+            // Remove from the parent's child list so a still-alive parent does not retain a disposed scope.
             if (_parent != null)
             {
                 lock (_parent._lock)
@@ -1237,38 +1701,132 @@ namespace Didionysymus.Lattice.Runtime.Internal
                 }
             }
 
-            // Reverse-creation order so dependents Dispose before their dependencies
-            for (int i = _disposables.Count - 1; i >= 0; i--)
+            // Take the disposal list under the lock: an add that raced with the latch is either in this copy or was
+            // refused. Dispose in reverse creation order, outside the lock, so dependents go before their dependencies.
+            // A service's own exception, an AggregateException included, is one entry.
+            IDisposable[] disposables;
+            lock (_lock)
+            {
+                disposables = _disposables.ToArray();
+                _disposables.Clear();
+            }
+
+            for (int i = disposables.Length - 1; i >= 0; i--)
             {
                 try
                 {
-                    _disposables[i].Dispose();
+                    disposables[i].Dispose();
                 }
-                catch
+                catch (Exception exception)
                 {
-                    // Swallow per-disposable: do not let one failed
-                    // dispose block the rest of the chain
+                    failures.Add(exception);
                 }
             }
 
-            _disposables.Clear();
-            _scopedCache.Clear();
-            _scopedDecoratedCache.Clear();
-            _creationOrder.Clear();
+            // Release everything else this scope tracked, and the participant source, which was cancelled above. The
+            // settle signal stays: a startup loop still running completes it when its participant returns.
+            lock (_lock)
+            {
+                _scopedCache.Clear();
+                _scopedDecoratedCache.Clear();
+                _singletonCache?.Clear();
+                _singletonDecoratedCache?.Clear();
+                _creationOrder.Clear();
+                _initialized.Clear();
+                _children.Clear();
+                participantCancellation = _participantCancellation;
+                _participantCancellation = null;
+            }
+
+            participantCancellation?.Dispose();
+            _resolutionStack.Dispose();
+            _disposalCompleted.TrySetResult(true);
+
+            if (failures.Count > 0) throw new AggregateException(DisposalFailureMessage, failures);
         }
 
         /// <summary>
         /// Ensures that the current <see cref="Scope"/> instance is not disposed before performing an action.
-        /// Throws an exception if the instance has already been disposed.
+        /// Throws an exception if the instance has already been disposed. Reads the state without the lock when called
+        /// on the public surface; wherever a decision depends on it, the caller holds <c>_lock</c> or re-checks under it.
         /// </summary>
         /// <exception cref="ObjectDisposedException">
         /// Thrown when the <see cref="Scope"/> has been disposed and an operation is attempted on it.
         /// </exception>
         private void ThrowIfDisposed()
         {
-            if (!_disposed) return;
-            
+            if (_state != LifecycleState.Disposed) return;
+
             throw new ObjectDisposedException(nameof(Scope));
+        }
+        
+        /// <summary>
+        /// Rejects a lifecycle call on a scope that is being shut down or has been disposed. The caller holds
+        /// <c>_lock</c>.
+        /// </summary>
+        /// <exception cref="ObjectDisposedException">Thrown when this scope has been disposed.</exception>
+        /// <exception cref="InvalidOperationException">Thrown when a shutdown is waiting on this scope.</exception>
+        private void ThrowIfStoppingOrDisposed()
+        {
+            if (_state == LifecycleState.Disposed) throw new ObjectDisposedException(nameof(Scope));
+
+            if (_state == LifecycleState.Stopping)
+            {
+                throw new InvalidOperationException(
+                    "This scope is shutting down; lifecycle calls are refused until it is disposed."
+                );
+            }
+        }
+
+        /// <summary>
+        /// Adds the failures <paramref name="exception"/> stands for to <paramref name="failures"/>. An
+        /// <see cref="AggregateException"/> thrown by a child scope's disposal or by a cancellation's callbacks
+        /// contributes its inner exceptions, so a disposal reports one flat list; any other exception is added as it
+        /// is. A tracked object's own exception is added by the caller directly, so it stays one entry.
+        /// </summary>
+        /// <param name="failures">The failure list being collected.</param>
+        /// <param name="exception">The exception a child scope's <c>Dispose</c> or a <c>Cancel</c> threw.</param>
+        private static void AddFailures(List<Exception> failures, Exception exception)
+        {
+            if (exception is AggregateException aggregate)
+            {
+                failures.AddRange(aggregate.InnerExceptions);
+                return;
+            }
+
+            failures.Add(exception);
+        }
+
+        /// <summary>
+        /// Disposes, last built first, each <see cref="IDisposable"/> among <paramref name="refused"/>: objects an
+        /// activation built after their scope's disposal began, which that disposal will never see. Every one is
+        /// disposed whatever an earlier one threw. Returns the exception the resolve then throws.
+        /// </summary>
+        /// <param name="refused">The objects that were not tracked, in the order they were built.</param>
+        /// <returns>
+        /// An <see cref="ObjectDisposedException"/> naming the scope; when one of the disposals threw, it carries the
+        /// first such exception as its inner exception.
+        /// </returns>
+        private static ObjectDisposedException DisposeRefusedObjects(IReadOnlyList<object> refused)
+        {
+            Exception firstFailure = null;
+            for (int i = refused.Count - 1; i >= 0; i--)
+            {
+                if (refused[i] is not IDisposable disposable) continue;
+
+                try
+                {
+                    disposable.Dispose();
+                }
+                catch (Exception exception)
+                {
+                    if (firstFailure == null) firstFailure = exception;
+                }
+            }
+
+            return firstFailure == null
+                ? new ObjectDisposedException(nameof(Scope))
+                : new ObjectDisposedException(RefusedObjectMessage, firstFailure);
         }
         
         /// <summary>

@@ -103,10 +103,8 @@ A thrown `StartAsync` arrives as `LifecycleException` (`Phase == LifecyclePhase.
 faults the scope. Cancelling the token after startup began, or disposing the scope during startup, stops further
 participants, faults the scope and cancels the returned task. Dispose and rebuild; do not retry. Participants should
 observe the token they receive and return promptly; Lattice waits for a running participant and never abandons it.
-Participants now receive a token linked to the caller's, not the caller's token itself, and it covers startup only:
-its source is disposed when startup ends, so a later cancellation of the caller's token or a later `Dispose` no longer
-reaches it. A participant that starts background work with that token and returns, relying on the caller cancelling
-it later, passes that work a token of its own instead.
+Participants receive a token the scope owns, not the caller's token itself; see "The participant token lasts until
+disposal" below.
 
 ### Startup continues on the caller's context
 
@@ -114,3 +112,32 @@ Call `RunAsyncStartablesAsync` from the Unity main thread and await it; do not b
 then runs on the main thread even when an earlier participant's task completed on a worker thread. Code that relied
 on later participants running on a thread-pool thread moves that work into `Task.Run` inside its own `StartAsync`.
 Code inside a participant after its own `ConfigureAwait(false)` still runs wherever that await resumed.
+
+### Dispose reports cleanup failures
+
+`Dispose` no longer swallows exceptions. It disposes everything and then throws one `AggregateException` listing each
+failure. Code that disposed scopes in `finally` blocks or `using` statements should expect it; in Unity, an
+`OnDestroy` that disposes a scope logs it. Make each `Dispose` method you own safe to call once and quiet on success.
+An exception thrown by `Dispose` while a `using` block unwinds replaces the exception it was unwinding. In a
+`LifetimeScopeBehaviour` subclass, call `base.OnDestroy()` last, after your own cleanup, so a failed disposal does not
+skip it. A `Dispose` method must not resolve from the scope being disposed: that resolve throws
+`ObjectDisposedException`, which now joins the aggregate.
+
+### Shut scopes down with ShutdownAsync
+
+Where an owner can await (a scene transition, an async exit path), replace `resolver.Dispose()` with
+`await resolver.ShutdownAsync(token)`: it cancels startup work, waits for the running participant to return, then
+disposes on your context. Pass a token to bound the wait. `Dispose` remains the immediate path. Do not await it from
+inside a `StartAsync` of the same scope.
+
+### The participant token lasts until disposal
+
+Work a startup participant runs with the token it received is now cancelled when the scope is disposed or shut down.
+A participant that kept the token for background work no longer needs a token of its own for that. Work that must
+outlive the scope needs its own token.
+
+### Every decorator in a chain is owned
+
+Intermediate decorators are now disposed, initialized and started, and a Transient's inner instance and decorators are
+disposed with the scope. Remove any forwarding of `Initialize`, `StartAsync` or `Dispose` from a decorator to the
+object it wraps.

@@ -148,6 +148,27 @@ namespace Didionysymus.Lattice.Tests.Runtime.Fixtures
     }
 
     /// <summary>
+    /// <see cref="IDisposable"/> whose <c>Dispose</c> throws <see cref="NotSupportedException"/>, so a host that
+    /// disposes its resolver meets a cleanup failure.
+    /// </summary>
+    public sealed class PlayModeThrowingDisposable : IDisposable
+    {
+        public void Dispose() => throw new NotSupportedException("host dispose failed");
+    }
+
+    /// <summary>
+    /// Host that builds its own resolver with <see cref="PlayModeThrowingDisposable"/> as a Singleton, so its
+    /// <c>OnDestroy</c> disposes an object that throws.
+    /// </summary>
+    public sealed class ThrowingDisposableHost : LifetimeScopeBehaviour
+    {
+        protected override void Configure(IContainerBuilder builder)
+        {
+            builder.RegisterFactory<PlayModeThrowingDisposable>(_ => new PlayModeThrowingDisposable(), Lifetime.Singleton);
+        }
+    }
+
+    /// <summary>
     /// <see cref="IAsyncStartable"/> that records the managed thread its <c>StartAsync</c> was called on.
     /// </summary>
     public sealed class ThreadRecordingStartable : IAsyncStartable

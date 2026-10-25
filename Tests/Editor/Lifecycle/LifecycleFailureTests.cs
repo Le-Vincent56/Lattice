@@ -124,5 +124,22 @@ namespace Didionysymus.Lattice.Tests.Editor.Lifecycle
             Assert.AreEqual(LifecyclePhase.Initialize, exception.Phase, "The failure names the phase");
             Assert.IsInstanceOf<InvalidOperationException>(exception.InnerException, "The participant's exception is inside");
         }
+
+        /// <summary>
+        /// A child of a faulted parent is refused with the parent's fault as inner exception, quoted in the message.
+        /// </summary>
+        [Test]
+        public void RunInitializables_WhenParentFaulted_ThrowsQuotingParentFault()
+        {
+            IObjectResolver root = Container.Build(_ => { });
+            root.RunInitializables();
+            IObjectResolver child = root.CreateChildScope(_ => { });
+            LifecycleException rootFault = Assert.Throws<LifecycleException>(() => root.InitializeInstance(new ThrowingInitializable()));
+
+            InvalidOperationException refusal = Assert.Throws<InvalidOperationException>(() => child.RunInitializables());
+
+            Assert.AreSame(rootFault, refusal.InnerException, "The refusal carries the parent's fault");
+            StringAssert.Contains(rootFault.Message, refusal.Message, "The refusal quotes the parent's fault");
+        }
     }
 }

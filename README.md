@@ -84,6 +84,13 @@ never changes what a parent-owned instance is made of; it only shadows for resol
 dependency that only a child registers does not satisfy a parent-owned service; resolving that service throws
 `RegistrationNotFoundException`.
 
+**Ownership.** A scope owns what it built: Singletons (the root), Scoped instances (the scope whose registration it
+is), disposable Transients (the scope that resolved them), and every object of a decorator chain it built. The caller
+owns what it supplied: `RegisterInstance` values, scene components, objects passed to `Inject` or
+`InitializeInstance`. A scope never disposes, destroys or releases what the caller owns beyond dropping its own
+references. To hand a supplied object to the container, register it through a factory:
+`RegisterFactory(_ => instance, Lifetime.Singleton)` at the root, `Lifetime.Scoped` in a child.
+
 **Captive dependency rule** (enforced at `Build`): a `Singleton` may not depend on a `Scoped`, directly or through
 any chain of `Transient`s. Everything else is allowed. Violations throw `CaptiveDependencyException` with the full
 chain.
@@ -146,8 +153,10 @@ builder.RegisterDecorator<IFoo, FooMetrics>(Lifetime.Scoped);
 // Last registered is outermost. Each decorator takes the wrapped service as its first ctor param.
 ```
 
-The container initializes and disposes the decorated inner instance as well as each decorator, so a decorator must
-not forward `Initialize` or `Dispose` to the instance it wraps; forwarding would run each call on the inner twice.
+The container owns every object of a chain it builds. For a Singleton or Scoped service, the inner instance and every
+decorator, not only the outermost, are initialized and started innermost first and disposed outermost first; for a
+Transient, the inner instance and each disposable decorator are disposed with the requesting scope. A decorator must
+not forward `Initialize`, `StartAsync` or `Dispose` to the object it wraps; forwarding would run each call twice.
 
 ## Open generics
 
@@ -170,13 +179,14 @@ public sealed class CatalogLoader : IInitializable, IDisposable
 - **Who participates.** `RunInitializables()` builds every `Singleton` or `Scoped` registration of its scope whose
   implementation type, or a decorator type registered for its service type, implements `IInitializable`, then calls
   `Initialize()` once per instance. `Transient` registrations never participate. A `RegisterInstance` value is
-  caller-owned: the container neither initializes nor disposes it; call `resolver.InitializeInstance(instance)` after
-  the pass if it needs `Initialize`. A factory participates when its service type is `IInitializable`; otherwise
+  caller-owned: the container neither initializes, starts nor disposes it; call `resolver.InitializeInstance(instance)`
+  after the pass if it needs `Initialize`, or register it through `RegisterFactory(_ => instance, ...)` to make it the
+  container's. A factory participates when its service type is `IInitializable`; otherwise
   register the concrete type and alias the interface: `RegisterFactory<Loader>(..., Lifetime.Singleton).As<ILoader>()`.
   Closed generics participate once preserved with `PreserveClosedGenerics`.
 - **Order.** Every participant is constructed before any is initialized. `Initialize` runs in creation order: a
   dependency before anything constructed with it, independent participants in registration order, a decorated
-  instance before its decorator. `IDisposable.Dispose()` runs on scope disposal in the reverse order.
+  instance before its decorator.
 - **Once, by reference.** A scope initializes an instance at most once across repeated passes and
   `InitializeInstance` calls, whichever registrations or aliases refer to it.
 - **Per scope, parents first.** Each scope runs its own pass over its own registrations. `RunInitializables` on a
@@ -201,14 +211,25 @@ public sealed class CatalogLoader : IInitializable, IDisposable
   `Phase == LifecyclePhase.Start` and faults the scope. The token is checked before and between participants;
   cancelling it after startup began, or disposing the scope, stops further participants, faults the scope and cancels
   the returned task. Participants should observe the token they receive; Lattice waits for a running participant and
-  never abandons it. `Dispose` does not wait. The token a participant receives covers startup only: its source is
-  disposed when startup ends, so a later cancellation of the caller's token or a later `Dispose` no longer reaches it.
-  Give work that outlives `StartAsync` a token of its own.
+  never abandons it. `Dispose` does not wait.
+- **Participant token.** The token a participant receives is the scope's own. It is cancelled when the caller's token
+  is cancelled during startup, or when the scope is shut down or disposed at any time until then; cancelling the
+  caller's token after startup ended does not reach it. A participant may keep it for background work that should end
+  with the scope; work that must outlive the scope needs a token of its own.
 - **Startup context.** Startup continues on the caller's synchronization context between participants: call it from
   the Unity main thread and every `StartAsync` runs on the main thread. A caller without a context (a thread-pool
   thread) continues on the thread pool. Await it; never block on the task. This covers the calls Lattice makes: code
   inside a participant after its own `ConfigureAwait(false)` is the participant's responsibility. A participant that
   completes asynchronously resumes startup no earlier than the next frame.
+- **Dispose.** `Dispose` cancels the participant token, disposes child scopes (each its own subtree first), then the
+  scope's own disposables in reverse order of creation; disposing a child never touches its parent. Every step runs
+  whatever an earlier one threw, and `Dispose` then throws one `AggregateException` listing each failure in the order
+  it happened; the scope is disposed either way. A second `Dispose` does nothing. Afterwards the scope tracks nothing:
+  no cached instance, initialized object or token registration. A resolve that completes after disposal began with a
+  disposable object disposes what it built and throws `ObjectDisposedException` (a non-disposable Transient is simply
+  returned, untracked); a pass or startup that observes the disposal stops before the
+  next participant. A disposed scope keeps its registrations, `RegisterInstance` values included; drop the reference
+  to release them.
 
 Trigger the phases on the resolver:
 
@@ -216,7 +237,19 @@ Trigger the phases on the resolver:
 resolver.RunInitializables();
 await resolver.RunAsyncStartablesAsync(cancellationToken); // after the pass, from the main thread
 resolver.InitializeInstance(handBuiltObject); // externally supplied objects, after the pass
+await resolver.ShutdownAsync(cancellationToken); // when the owner ends the scope and can await
 ```
+
+### Shutdown
+
+`await resolver.ShutdownAsync(token)` stops lifecycle work on the scope and its descendants, cancels their participant
+tokens, waits for any running startup to settle (the running participant returns), then disposes the scope on the
+caller's synchronization context. Resolves keep working while it waits; lifecycle calls are refused. The token bounds
+the wait: when it is cancelled the scope is disposed at once and the task completes as cancelled. Disposal failures
+fault the task with `Dispose`'s aggregate; on a scope already disposed the task completes once that disposal has
+finished. Never await it from inside a `StartAsync` of the scope or a descendant while that startup runs; it is
+refused with `InvalidOperationException`. `Dispose` remains the immediate path: it cancels and disposes without
+waiting.
 
 ## Unity integration
 

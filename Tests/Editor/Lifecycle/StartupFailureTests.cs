@@ -97,5 +97,26 @@ namespace Didionysymus.Lattice.Tests.Editor.Lifecycle
             Assert.IsInstanceOf<LifecycleException>(caught, "A null task is a failed participant");
             Assert.AreEqual(typeof(NullTaskStartable), ((LifecycleException)caught).ParticipantType, "The exception names the participant");
         }
+
+        /// <summary>
+        /// A child's startup under a faulted parent is refused with the parent's fault as inner exception, quoted in
+        /// the message.
+        /// </summary>
+        [Test]
+        public async Task RunAsyncStartablesAsync_WhenParentFaulted_ThrowsQuotingParentFault()
+        {
+            IObjectResolver root = Container.Build(_ => { });
+            root.RunInitializables();
+            await root.RunAsyncStartablesAsync(CancellationToken.None);
+            IObjectResolver child = root.CreateChildScope(_ => { });
+            child.RunInitializables();
+            LifecycleException rootFault = Assert.Throws<LifecycleException>(() => root.InitializeInstance(new ThrowingInitializable()));
+
+            Exception caught = await TaskCapture.CatchAsync(child.RunAsyncStartablesAsync(CancellationToken.None));
+
+            Assert.IsInstanceOf<InvalidOperationException>(caught, "A child of a faulted parent is refused");
+            Assert.AreSame(rootFault, caught.InnerException, "The refusal carries the parent's fault");
+            StringAssert.Contains(rootFault.Message, caught.Message, "The refusal quotes the parent's fault");
+        }
     }
 }

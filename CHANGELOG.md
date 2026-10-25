@@ -10,6 +10,7 @@ All notable changes to this package are documented here. Format based on
 - `ResolverLifecycleExtensions.InitializeInstance(object)`: initializes an externally supplied `IInitializable` once per scope, by reference, through the same tracking as services; returns whether it ran. (minor)
 - `LifecycleException` (a `DependencyResolutionException` with `ParticipantType` and `Phase`) and `LifecyclePhase`. (minor)
 - `LifecyclePhase.Start`, reported by `LifecycleException` when a `StartAsync` fails. (minor)
+- `ResolverLifecycleExtensions.ShutdownAsync(CancellationToken)`: stops lifecycle work on a scope and its descendants, cancels their participant tokens, waits for running startup to settle, then disposes the scope on the caller's context; the token bounds the wait, and disposal failures fault the task. (minor)
 
 ### Changed
 - A Scoped service registered in a parent scope is now constructed with that parent as its resolver. A child scope's registrations can no longer be captured by it, a dependency registered only in a child no longer satisfies it (the resolve throws `RegistrationNotFoundException`), and the `IDisposable` Transients created for it are disposed with the parent instead of the first child that asked. (major)
@@ -26,13 +27,19 @@ All notable changes to this package are documented here. Format based on
 - `RunAsyncStartablesAsync` runs in creation order (dependencies first, independents in registration order across service types) instead of grouping by service type. (major)
 - Startup runs once per scope: a call after it succeeded starts nothing, and a call while it runs, including from inside `StartAsync`, throws `InvalidOperationException`. Once startup has begun, `RunInitializables` initializes nothing: it returns when nothing is pending and throws `InvalidOperationException` naming an `IInitializable` created since; initialize such objects with `InitializeInstance`. (major)
 - A thrown `StartAsync` now surfaces as `LifecycleException` with `Phase == LifecyclePhase.Start` and faults the scope, like a failed `Initialize`. (major)
-- `RunAsyncStartablesAsync` checks its token before and between participants and stops scheduling on cancellation; cancellation after startup began faults the scope and completes the task as cancelled. Disposing a scope cancels its running startup through the token participants receive, and a disposed scope never completes startup. Participants now receive a token linked to the caller's instead of the caller's token itself; it covers startup only, so a later cancellation of the caller's token or a later `Dispose` no longer reaches work a participant started with it. (major)
+- `RunAsyncStartablesAsync` checks its token before and between participants and stops scheduling on cancellation; cancellation after startup began faults the scope and completes the task as cancelled. Disposing a scope cancels its running startup through the token participants receive, and a disposed scope never completes startup. (major)
 - `RunAsyncStartablesAsync` continues on the caller's synchronization context between participants; called from the Unity main thread, every `StartAsync` runs on the main thread. (major)
+- `Dispose` now runs every cleanup step and then throws one `AggregateException` listing each failure, in the order it happened, when a child scope's disposal, a tracked object's `Dispose` or a token callback threw; previously each was swallowed. The scope is disposed either way, and a second `Dispose` does nothing. (major)
+- The token startup participants receive now lives until the scope is disposed: `Dispose` and `ShutdownAsync` cancel it before anything is disposed, so work a participant started with it ends with the scope. Cancelling the caller's token after startup ended still does not reach it. (major)
+- Every decorator in a Singleton or Scoped chain is now disposed, initialized and started, not only the outermost; a Transient's inner instance and each of its decorators are now disposed with the requesting scope. A decorator must not forward `Initialize`, `StartAsync` or `Dispose` to the object it wraps. (major)
+- `RunInitializables` and `RunAsyncStartablesAsync` stop before the next participant when the scope is disposed during them; the pass then throws `ObjectDisposedException`. (major)
 
 ### Fixed
 - README's Lifetimes table said Scoped instances were cached in the resolving scope; they are cached in the scope that owns the registration, which is what the code and tests have always done. The captive-dependency rule is restated as implemented: a Singleton may not depend on a Scoped. (patch)
 - `RunInitializables` compares participants by reference; two distinct instances of a type with value equality are both initialized. (patch)
 - A faulted scope quotes its first fault in every later refusal, even when a second failure races with the first. (patch)
+- A disposed scope no longer holds the objects it initialized, its root Singletons or its internal token and thread resources. A disposable Transient whose resolve completes after its scope's disposal began is disposed, and the resolve throws `ObjectDisposedException`; `CreateChildScope` on a parent disposed meanwhile throws `ObjectDisposedException` instead of returning a child nothing disposes. (patch)
+- A child scope whose parent is faulted is refused with the parent's fault as inner exception and message; the message for an initializable created after the pass no longer says it was created after startup began. (patch)
 
 ## [1.0.2] - 2026-05-29
 - Added LICENSE.md meta file to prevent Unity package import errors.

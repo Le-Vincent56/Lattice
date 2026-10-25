@@ -12,6 +12,7 @@ namespace Didionysymus.Lattice.Tests.Editor.Lifecycle
     ///     <item>Scoped <see cref="IDisposable"/> instances are disposed when the scope is disposed, in reverse-creation order (last created -> first disposed)</item>
     ///     <item>Calling <c>Dispose</c> twice is idempotent; the second call is a no-op</item>
     ///     <item>Transient instances that implement <see cref="IDisposable"/> are tracked on the resolving scope and disposed when that scope is disposed</item>
+    ///     <item>A <c>RegisterInstance</c> value is never disposed; the same object supplied through a factory is</item>
     /// </list>
     ///
     /// Exercises <c>Scope.Dispose</c>'s reverse-iteration loop,
@@ -134,6 +135,37 @@ namespace Didionysymus.Lattice.Tests.Editor.Lifecycle
 
             Assert.IsTrue(decorator.IsDisposed, "The decorator is disposed with its scope");
             Assert.IsTrue(inner.IsDisposed, "The decorated inner instance is disposed with its scope too");
+        }
+
+        /// <summary>
+        /// A <c>RegisterInstance</c> value stays the caller's: disposing the scope does not dispose it.
+        /// </summary>
+        [Test]
+        public void Dispose_WhenInstanceRegistered_DoesNotDisposeIt()
+        {
+            LoggedDisposable supplied = new LoggedDisposable("supplied");
+            IObjectResolver resolver = Container.Build(b => b.RegisterInstance(supplied));
+            resolver.Resolve<LoggedDisposable>();
+
+            resolver.Dispose();
+
+            Assert.AreEqual(0, supplied.DisposeCount, "The container never disposes a supplied instance");
+        }
+
+        /// <summary>
+        /// A supplied object handed to the container through a factory is the container's: disposing the scope
+        /// disposes it.
+        /// </summary>
+        [Test]
+        public void Dispose_WhenInstanceSuppliedThroughFactory_DisposesIt()
+        {
+            LoggedDisposable supplied = new LoggedDisposable("supplied");
+            IObjectResolver resolver = Container.Build(b => b.RegisterFactory<LoggedDisposable>(_ => supplied, Lifetime.Singleton));
+            resolver.Resolve<LoggedDisposable>();
+
+            resolver.Dispose();
+
+            Assert.AreEqual(1, supplied.DisposeCount, "A factory-supplied object is owned and disposed once");
         }
     }
 }

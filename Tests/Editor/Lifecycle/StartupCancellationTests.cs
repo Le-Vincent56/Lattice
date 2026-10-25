@@ -157,7 +157,7 @@ namespace Didionysymus.Lattice.Tests.Editor.Lifecycle
             gated.Gate.SetResult(true);
             Exception caught = await TaskCapture.CatchAsync(startup);
 
-            Assert.AreEqual(LifecycleState.Faulted, ((Scope)resolver).State, "A scope disposed during startup never becomes ready");
+            Assert.AreEqual(LifecycleState.Disposed, ((Scope)resolver).State, "A scope disposed during startup never becomes ready");
             Assert.IsInstanceOf<OperationCanceledException>(caught, "Startup completes as cancelled");
         }
 

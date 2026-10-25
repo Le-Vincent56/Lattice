@@ -14,14 +14,25 @@ namespace Didionysymus.Lattice.Tests.Editor.Hierarchy
     ///     <item>a disposed scope refuses further resolves with <see cref="ObjectDisposedException"/></item>
     ///     <item>a child scope's <c>Dispose</c> disposes its own scoped <see cref="IDisposable"/> instances</item>
     ///     <item>a parent-owned instance and its disposables survive the disposal of a child that requested it</item>
+    ///     <item>disposing the root disposes its children's disposables, before the root's own</item>
     /// </list>
     ///
     /// Exercises <c>Scope.ResolveInternal</c>'s parent-chain walk, <c>Scope._scopedCache</c>
-    /// and <c>_disposables</c> ownership, and <c>Scope.ThrowIfDisposed</c>'s public-surface gate.
+    /// and <c>_disposables</c> ownership, <c>Scope.Dispose</c>'s cascade, and <c>Scope.ThrowIfDisposed</c>'s
+    /// public-surface gate.
     /// </summary>
     [TestFixture]
     public sealed class ScopeHierarchyTests
     {
+        /// <summary>
+        /// Resets the static fixture state the tests read.
+        /// </summary>
+        [SetUp]
+        public void Reset()
+        {
+            DisposalLog.Events.Clear();
+        }
+
         /// <summary>
         /// A child scope must resolve a service registered only in the parent.
         /// The miss-on-child and walk-to-parent path in <c>Scope.ResolveInternal</c>.
@@ -166,6 +177,37 @@ namespace Didionysymus.Lattice.Tests.Editor.Hierarchy
             child.Dispose();
 
             Assert.IsFalse(fromChild.Dependency.IsDisposed, "The root's Singleton must stay usable after a child is disposed");
+        }
+
+        /// <summary>
+        /// Disposing the root disposes its child scopes, and with them the disposables each child owns.
+        /// </summary>
+        [Test]
+        public void Dispose_WhenRootDisposed_DisposesChildScopeDisposables()
+        {
+            IObjectResolver root = Container.Build(_ => { });
+            IObjectResolver child = root.CreateChildScope(b => b.RegisterFactory<LoggedDisposable>(_ => new LoggedDisposable("child"), Lifetime.Scoped));
+            LoggedDisposable owned = child.Resolve<LoggedDisposable>();
+
+            root.Dispose();
+
+            Assert.AreEqual(1, owned.DisposeCount, "The cascade disposes what the child owns, once");
+        }
+
+        /// <summary>
+        /// The cascade disposes a child's disposables before the root's own.
+        /// </summary>
+        [Test]
+        public void Dispose_WhenRootDisposed_DisposesChildDisposablesBeforeRootDisposables()
+        {
+            IObjectResolver root = Container.Build(b => b.RegisterFactory<LoggedDisposable>(_ => new LoggedDisposable("root"), Lifetime.Singleton));
+            IObjectResolver child = root.CreateChildScope(b => b.RegisterFactory<IDisposable>(_ => new LoggedDisposable("child"), Lifetime.Scoped));
+            root.Resolve<LoggedDisposable>();
+            child.Resolve<IDisposable>();
+
+            root.Dispose();
+
+            CollectionAssert.AreEqual(new[] { "child:dispose", "root:dispose" }, DisposalLog.Events, "Children are disposed before the root's own objects");
         }
     }
 }

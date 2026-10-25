@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using NUnit.Framework;
@@ -34,6 +35,7 @@ namespace Didionysymus.Lattice.Tests.Runtime
     ///     <item><see cref="UnityResolverExtensions.InitializeGameObject"/> initializes a component once per scope and refuses to run before the scope's pass</item>
     ///     <item><see cref="UnityResolverExtensions.InjectGameObject"/> populates <c>[Inject]</c> fields after the fact; <see cref="UnityResolverExtensions.InstantiateAndInject{T}"/> spawns and binds, and does not initialize</item>
     ///     <item>A host handed an already started scope through <see cref="LifetimeScopeBehaviour.SetResolver"/> still binds and initializes its scene</item>
+    ///     <item>A host disposing a self-built resolver whose cleanup failed surfaces the <see cref="AggregateException"/>, which Unity logs</item>
     /// </list>
     /// All fixtures are runtime-created GameObjects (no scene assets, no prefab assets); each <c>[UnityTest]</c>
     /// yields one frame so <c>Awake</c>/<c>Start</c> complete before assertions run.
@@ -334,6 +336,38 @@ namespace Didionysymus.Lattice.Tests.Runtime
             {
                 resolver.Dispose();
             }
+        }
+
+        /// <summary>
+        /// A host that built its own resolver disposes it in <c>OnDestroy</c>; when a service's <c>Dispose</c> throws,
+        /// the disposal's <see cref="AggregateException"/> surfaces and Unity logs it. Unity logs an aggregate under its
+        /// innermost exception's message and names the aggregate in the logged stack trace, so the test expects the
+        /// service's message and reads the stack trace.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator OnDestroy_WhenSelfBuiltServiceDisposeThrows_LogsAggregateException()
+        {
+            _scopeGo = new GameObject("ThrowingHost");
+            ThrowingDisposableHost host = _scopeGo.AddComponent<ThrowingDisposableHost>();
+            host.Resolver.Resolve<PlayModeThrowingDisposable>();
+            string loggedStackTrace = null;
+            Application.LogCallback capture = (condition, stackTrace, type) => { if (type == LogType.Exception) loggedStackTrace = stackTrace; };
+            Application.logMessageReceived += capture;
+            LogAssert.Expect(LogType.Exception, new Regex("host dispose failed"));
+
+            try
+            {
+                Object.Destroy(_scopeGo);
+                yield return null;
+            }
+            finally
+            {
+                Application.logMessageReceived -= capture;
+            }
+
+            LogAssert.NoUnexpectedReceived();
+            StringAssert.Contains("AggregateException", loggedStackTrace, "The logged exception is the disposal's aggregate");
         }
     }
 }

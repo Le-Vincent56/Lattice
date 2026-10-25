@@ -5,7 +5,8 @@ namespace Didionysymus.Lattice.Runtime.Internal
     /// <see cref="Initializing"/> while its initialization pass runs and <see cref="Initialized"/> once it completes,
     /// is <see cref="Starting"/> while its startup runs and <see cref="Ready"/> once it completes, and becomes
     /// <see cref="Faulted"/> when a pass or startup fails or startup is cancelled; a faulted scope refuses further
-    /// lifecycle calls.
+    /// lifecycle calls. <c>ShutdownAsync</c> moves any live scope to <see cref="Stopping"/>, and disposal moves any
+    /// scope to <see cref="Disposed"/>.
     /// </summary>
     internal enum LifecycleState
     {
@@ -37,6 +38,16 @@ namespace Didionysymus.Lattice.Runtime.Internal
         /// <summary>
         /// A pass, a supplied object's initialization or startup failed, or startup was cancelled. Terminal.
         /// </summary>
-        Faulted
+        Faulted,
+
+        /// <summary>
+        /// A shutdown is waiting for running startup work; resolves work, lifecycle calls are refused.
+        /// </summary>
+        Stopping,
+
+        /// <summary>
+        /// Disposal began. Terminal.
+        /// </summary>
+        Disposed
     }
 }
