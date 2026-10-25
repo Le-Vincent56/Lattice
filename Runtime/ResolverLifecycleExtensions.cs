@@ -113,5 +113,21 @@ namespace Didionysymus.Lattice.Runtime
 
             return scope.ShutdownAsync(cancellationToken);
         }
+        
+        /// <summary>
+        /// Reads where the scope is in its lifecycle: created, initializing, initialized, starting, ready, faulted,
+        /// stopping or disposed. Reads under the scope's lock, so it is safe from any thread; a disposed scope reports
+        /// <see cref="LifecycleState.Disposed"/> instead of throwing.
+        /// </summary>
+        /// <param name="resolver">The resolver. Must be the built-in <see cref="Scope"/> implementation.</param>
+        /// <returns>The scope's current state.</returns>
+        /// <exception cref="InvalidOperationException">Thrown when <paramref name="resolver"/> is not the built-in <see cref="Scope"/>, a null resolver included.</exception>
+        public static LifecycleState GetLifecycleState(this IObjectResolver resolver)
+        {
+            if (resolver is not Scope scope)
+                throw new InvalidOperationException("GetLifecycleState is only supported on the built-in Scope resolver.");
+
+            return scope.State;
+        }
     }
 }

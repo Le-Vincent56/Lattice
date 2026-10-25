@@ -116,11 +116,11 @@ Code inside a participant after its own `ConfigureAwait(false)` still runs where
 ### Dispose reports cleanup failures
 
 `Dispose` no longer swallows exceptions. It disposes everything and then throws one `AggregateException` listing each
-failure. Code that disposed scopes in `finally` blocks or `using` statements should expect it; in Unity, an
-`OnDestroy` that disposes a scope logs it. Make each `Dispose` method you own safe to call once and quiet on success.
+failure. Code that disposed scopes in `finally` blocks or `using` statements should expect it; in Unity,
+`LifetimeScopeBehaviour` logs each failure. Make each `Dispose` method you own safe to call once and quiet on success.
 An exception thrown by `Dispose` while a `using` block unwinds replaces the exception it was unwinding. In a
-`LifetimeScopeBehaviour` subclass, call `base.OnDestroy()` last, after your own cleanup, so a failed disposal does not
-skip it. A `Dispose` method must not resolve from the scope being disposed: that resolve throws
+`LifetimeScopeBehaviour` subclass, call `base.OnDestroy()` last, after your own cleanup, so that cleanup still sees
+`Resolver`. A `Dispose` method must not resolve from the scope being disposed: that resolve throws
 `ObjectDisposedException`, which now joins the aggregate.
 
 ### Shut scopes down with ShutdownAsync
@@ -141,3 +141,21 @@ outlive the scope needs its own token.
 Intermediate decorators are now disposed, initialized and started, and a Transient's inner instance and decorators are
 disposed with the scope. Remove any forwarding of `Initialize`, `StartAsync` or `Dispose` from a decorator to the
 object it wraps.
+
+### Drive additively loaded scenes with ExplicitScopeHost
+
+A scene host that must receive a scope its coordinator built no longer needs `SetResolver` to win a race with `Awake`.
+Put `ExplicitScopeHost` in the scene instead of a `LifetimeScopeBehaviour` subclass. After the scene loads, create the
+child from the parent you own, then `host.Attach(child, ScopeOwnership.Owned)`, `await host.PrepareAsync(token)`; other
+systems `await host.WaitUntilReadyAsync(token)`. Before unloading, `await host.ShutdownAsync(token)`. To hand a loaded
+scene to a new scope, shut the host down and attach the new scope; components are bound and initialized again, so
+their `Initialize` must be repeat-safe. Objects in the scene still receive `Awake` and `OnEnable`, and may receive
+`Start`, before preparation: keep dependency work in `Initialize`, or author the scene's roots inactive and activate
+them after the host is ready.
+
+### LifetimeScopeBehaviour after OnDestroy
+
+`Resolver` is null after `OnDestroy`; keep your own reference if you need the resolver later. Cleanup failures of a
+self-built resolver are logged one per entry and no longer thrown, so code in a subclass's `OnDestroy` after
+`base.OnDestroy()` always runs. A subclass that reads `Resolver` in its own `OnDestroy` reads it before calling
+`base.OnDestroy()`.

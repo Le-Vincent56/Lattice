@@ -522,4 +522,35 @@ namespace Didionysymus.Lattice.Tests.Editor.Fixtures
             return Task.CompletedTask;
         }
     }
+
+    /// <summary>
+    /// <see cref="IInitializable"/> that reads <see cref="Target"/>'s lifecycle state from inside its own
+    /// <c>Initialize</c> and stores it in <see cref="RecordedState"/>; tests reset both in <c>[SetUp]</c>.
+    /// </summary>
+    public sealed class StateRecordingInitializable : IInitializable
+    {
+        public static IObjectResolver Target;
+        public static LifecycleState RecordedState;
+
+        public void Initialize() => RecordedState = Target.GetLifecycleState();
+    }
+
+    /// <summary>
+    /// <see cref="IObjectResolver"/> that is not the built-in scope; every member throws
+    /// <see cref="NotSupportedException"/>, so a test can see which calls refuse a foreign resolver.
+    /// </summary>
+    public sealed class ForeignResolver : IObjectResolver
+    {
+        public T Resolve<T>() => throw new NotSupportedException("foreign resolver");
+
+        public object Resolve(Type type) => throw new NotSupportedException("foreign resolver");
+
+        public IReadOnlyList<T> ResolveAll<T>() => throw new NotSupportedException("foreign resolver");
+
+        public IObjectResolver CreateChildScope(Action<IContainerBuilder> configure) => throw new NotSupportedException("foreign resolver");
+
+        public void Inject(object instance) => throw new NotSupportedException("foreign resolver");
+
+        public void Dispose() => throw new NotSupportedException("foreign resolver");
+    }
 }

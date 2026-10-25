@@ -11,6 +11,8 @@ All notable changes to this package are documented here. Format based on
 - `LifecycleException` (a `DependencyResolutionException` with `ParticipantType` and `Phase`) and `LifecyclePhase`. (minor)
 - `LifecyclePhase.Start`, reported by `LifecycleException` when a `StartAsync` fails. (minor)
 - `ResolverLifecycleExtensions.ShutdownAsync(CancellationToken)`: stops lifecycle work on a scope and its descendants, cancels their participant tokens, waits for running startup to settle, then disposes the scope on the caller's context; the token bounds the wait, and disposal failures fault the task. (minor)
+- `LifecycleState` is public, and `ResolverLifecycleExtensions.GetLifecycleState()` reads a scope's state (created, initializing, initialized, starting, ready, faulted, stopping, disposed) from any thread, a disposed scope included. A member may be added to the enum in a minor version. (minor)
+- `ExplicitScopeHost`, a scene host a coordinator drives: `Attach(resolver, ScopeOwnership)`, `PrepareAsync` (binds a batch of roots, runs the scope's pass, initializes the batch's components, runs startup), `State` (`ScopeHostState`), `WaitUntilReadyAsync` for any number of callers, and `ShutdownAsync`. It never builds a resolver, becomes ready only when every step succeeded, and shuts an owned resolver down when it shuts down or is destroyed. (minor)
 
 ### Changed
 - A Scoped service registered in a parent scope is now constructed with that parent as its resolver. A child scope's registrations can no longer be captured by it, a dependency registered only in a child no longer satisfies it (the resolve throws `RegistrationNotFoundException`), and the `IDisposable` Transients created for it are disposed with the parent instead of the first child that asked. (major)
@@ -33,6 +35,8 @@ All notable changes to this package are documented here. Format based on
 - The token startup participants receive now lives until the scope is disposed: `Dispose` and `ShutdownAsync` cancel it before anything is disposed, so work a participant started with it ends with the scope. Cancelling the caller's token after startup ended still does not reach it. (major)
 - Every decorator in a Singleton or Scoped chain is now disposed, initialized and started, not only the outermost; a Transient's inner instance and each of its decorators are now disposed with the requesting scope. A decorator must not forward `Initialize`, `StartAsync` or `Dispose` to the object it wraps. (major)
 - `RunInitializables` and `RunAsyncStartablesAsync` stop before the next participant when the scope is disposed during them; the pass then throws `ObjectDisposedException`. (major)
+- `LifetimeScopeBehaviour.OnDestroy` logs each cleanup failure of a self-built resolver as its own console entry and does not throw. (major)
+- `LifetimeScopeBehaviour.Resolver` is null after `OnDestroy`. (major)
 
 ### Fixed
 - README's Lifetimes table said Scoped instances were cached in the resolving scope; they are cached in the scope that owns the registration, which is what the code and tests have always done. The captive-dependency rule is restated as implemented: a Singleton may not depend on a Scoped. (patch)
@@ -40,6 +44,7 @@ All notable changes to this package are documented here. Format based on
 - A faulted scope quotes its first fault in every later refusal, even when a second failure races with the first. (patch)
 - A disposed scope no longer holds the objects it initialized, its root Singletons or its internal token and thread resources. A disposable Transient whose resolve completes after its scope's disposal began is disposed, and the resolve throws `ObjectDisposedException`; `CreateChildScope` on a parent disposed meanwhile throws `ObjectDisposedException` instead of returning a child nothing disposes. (patch)
 - A child scope whose parent is faulted is refused with the parent's fault as inner exception and message; the message for an initializable created after the pass no longer says it was created after startup began. (patch)
+- `LifetimeScopeBehaviour.SetResolver` called after `OnDestroy` still throws `InvalidOperationException`, now with a message that names a destroyed host. (patch)
 
 ## [1.0.2] - 2026-05-29
 - Added LICENSE.md meta file to prevent Unity package import errors.

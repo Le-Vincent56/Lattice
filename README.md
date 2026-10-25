@@ -230,6 +230,11 @@ public sealed class CatalogLoader : IInitializable, IDisposable
   returned, untracked); a pass or startup that observes the disposal stops before the
   next participant. A disposed scope keeps its registrations, `RegisterInstance` values included; drop the reference
   to release them.
+- **State.** `resolver.GetLifecycleState()` returns where the scope is: `Created`, `Initializing`, `Initialized`,
+  `Starting`, `Ready`, `Faulted`, `Stopping` or `Disposed` (`LifecycleState`). It is safe from any thread, reports
+  `Disposed` for a disposed scope instead of throwing, and throws `InvalidOperationException` for a resolver that is not
+  the built-in scope. A member may be added to `LifecycleState` in a minor version; code that switches on it keeps a
+  default branch.
 
 Trigger the phases on the resolver:
 
@@ -238,6 +243,7 @@ resolver.RunInitializables();
 await resolver.RunAsyncStartablesAsync(cancellationToken); // after the pass, from the main thread
 resolver.InitializeInstance(handBuiltObject); // externally supplied objects, after the pass
 await resolver.ShutdownAsync(cancellationToken); // when the owner ends the scope and can await
+LifecycleState state = resolver.GetLifecycleState(); // any thread, any state
 ```
 
 ### Shutdown
@@ -268,9 +274,76 @@ public sealed class GameLifetimeScope : LifetimeScopeBehaviour
 }
 ```
 
-On `Awake` (running at `[DefaultExecutionOrder(int.MinValue + 100)]`) the scope builds its resolver, injects every
+On `Awake` the scope builds its resolver (or takes the one given to `SetResolver` before `Awake`), injects every
 MonoBehaviour in its scene, runs `RunInitializables` for its services, then initializes the scene's `IInitializable`
-components once each. If you override `Awake`, call `base.Awake()` first or the scene walk and both passes are skipped.
+components once each; a step that throws throws out of `Awake`, and nothing starts startables. If you override
+`Awake`, call `base.Awake()` first or the scene walk and both passes are skipped.
+`[DefaultExecutionOrder(int.MinValue + 100)]` makes this `Awake` run early among scripts Unity orders by execution
+order; it is not a guarantee against every script.
+
+`OnDestroy` disposes a self-built resolver and logs each cleanup failure as its own console entry; it does not throw.
+`Resolver` is null after `OnDestroy`, whoever owned it, so a subclass reads it before calling `base.OnDestroy()`.
+`SetResolver` after `Awake` or after `OnDestroy` throws `InvalidOperationException`.
+
+### Explicit host
+
+For a scene a coordinator loads additively and prepares when it chooses, put `ExplicitScopeHost` in the scene instead
+of a `LifetimeScopeBehaviour`:
+
+1. **Nothing happens on its own.** It implements no Unity message but `OnDestroy` and never builds a resolver. A host
+   nobody attaches stays `Detached`; the objects in its scene stay unbound and uninitialized.
+2. **Attach.** `Attach(resolver, ownership)` hands it a built-in resolver while it is `Detached`, before or after
+   `Awake`, active or inactive. It refuses a null resolver, a second attach, a resolver that is disposed, stopping or
+   running a pass or startup elsewhere, and a destroyed host. A `Created`, `Initialized`, `Ready` or `Faulted`
+   resolver is accepted; a faulted one makes `PrepareAsync` report its fault. It reads no scene.
+3. **Ownership.** `ScopeOwnership.Owned`: shutting the host down, or destroying it, shuts the resolver down.
+   `ScopeOwnership.Borrowed` (the default value): the host never disposes it. A borrowed scope is prepared by one host
+   at a time; prepare a second host after the first is ready.
+4. **Prepare.** `PrepareAsync(token)` fixes the batch as the scene's root GameObjects at the call, inactive ones
+   included; `PrepareAsync(roots, token)` uses the given roots (null and destroyed entries skipped). It binds every
+   MonoBehaviour under the batch, runs the scope's initialization pass, initializes the batch's `IInitializable`
+   components once, then runs the scope's startup and awaits it. It activates nothing. A call after `Ready` prepares
+   nothing; a call while preparing is refused.
+5. **Ready only on success.** The host becomes `Ready` only after every step succeeded while it was neither cancelled
+   nor shutting down. A failed step makes it `Faulted` with that exception: `PrepareAsync` and every readiness wait
+   fault with it. A cancellation once preparation began (the caller's token, or the scope stopped by its parent's
+   shutdown) also makes it `Faulted` and cancels those tasks. A token already cancelled at the call, or a scene that
+   cannot be read, changes nothing. `Faulted` lasts until shutdown. A borrowed scope that is already `Ready` is
+   supported.
+6. **Readiness.** `WaitUntilReadyAsync(token)` may be awaited by any number of callers. It completes on `Ready`, faults
+   with the fault, and is cancelled when the host shuts down before `Ready` or the caller's own token fires (that wait
+   only). It is refused when `Detached` and from inside the host's own startup.
+7. **Shutdown.** `ShutdownAsync(token)` cancels a running prepare, waits for it to settle, shuts an owned resolver down
+   with `ShutdownAsync` (or disposes it at once when the core refuses to wait because the caller is inside a startup
+   of that scope or a descendant), clears `Resolver` and leaves the host `Detached`. The token bounds the waits; an
+   owned resolver is shut down anyway. Cleanup failures fault the task with one `AggregateException`; concurrent calls
+   share one shutdown, and a joining call stops waiting at its own token; a call from inside the host's own startup
+   is refused, even while a shutdown runs. Afterwards `Attach` may hand the host a
+   new scope, and preparing binds and initializes the scene again, so a recycled scene's `Initialize` must be
+   repeat-safe.
+8. **Destruction.** `OnDestroy` (a scene unload, `Destroy`) starts the same shutdown without waiting and logs each
+   failure as its own entry; destroyed from inside its own startup, it disposes an owned resolver at once. Prefer
+   awaiting `ShutdownAsync` before unloading. A host whose GameObject was never active receives no `OnDestroy`; shut
+   it down explicitly.
+9. **Main thread.** Call every member on Unity's main thread; its awaits resume there. A public method called on
+   another thread is refused with `InvalidOperationException` before anything changes.
+10. **Before preparation.** Objects in the scene receive `Awake` and `OnEnable`, and may receive `Start`, before the
+    coordinator can prepare the host; Lattice promises no order. Keep dependency and gameplay work in `Initialize` or
+    later, or author the scene's roots inactive and activate them after `Ready`. Disabling the host component is not a
+    lifecycle barrier. Gameplay gating stays with the game.
+
+```csharp
+// In the coordinator, after the scene has loaded additively:
+IObjectResolver region = bootResolver.CreateChildScope(b => b.Register<IRegionService, RegionService>(Lifetime.Scoped));
+ExplicitScopeHost host = FindHostInLoadedScene(); // your own lookup
+host.Attach(region, ScopeOwnership.Owned);
+await host.PrepareAsync(cancellationToken);
+// elsewhere: await host.WaitUntilReadyAsync(cancellationToken);
+
+// Before unloading the scene:
+await host.ShutdownAsync(cancellationToken);
+await SceneManager.UnloadSceneAsync(regionScene);
+```
 
 ### Member injection and the two-phase contract
 
@@ -296,9 +369,10 @@ public sealed class HudPresenter : MonoBehaviour, IInitializable
 
 MonoBehaviour timing rules:
 
-1. Do not read injected fields in `Awake()`; they are populated by `Start()`.
-2. Put post-injection setup in `IInitializable.Initialize()`, which runs after Phase 1 completes across the scene,
-   after the scope's services are initialized, and before `Start()`. Components are initialized once per scope;
+1. Do not read injected fields in `Awake()`. Under `LifetimeScopeBehaviour` they are populated by `Start()`; under
+   `ExplicitScopeHost` they are populated once `PrepareAsync` bound them, which may be after `Start()`.
+2. Put post-injection setup in `IInitializable.Initialize()`, which runs after Phase 1 completes across the batch,
+   after the scope's services are initialized, and, under `LifetimeScopeBehaviour`, before `Start()`. Components are initialized once per scope;
    their order relative to each other is not a contract.
 3. Inject dynamically spawned prefabs explicitly, before their `Start()` runs. `InstantiateAndInject` binds only;
    initialize the clone's components afterwards with `InitializeGameObject`:

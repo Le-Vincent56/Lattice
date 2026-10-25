@@ -35,7 +35,10 @@ namespace Didionysymus.Lattice.Tests.Runtime
     ///     <item><see cref="UnityResolverExtensions.InitializeGameObject"/> initializes a component once per scope and refuses to run before the scope's pass</item>
     ///     <item><see cref="UnityResolverExtensions.InjectGameObject"/> populates <c>[Inject]</c> fields after the fact; <see cref="UnityResolverExtensions.InstantiateAndInject{T}"/> spawns and binds, and does not initialize</item>
     ///     <item>A host handed an already started scope through <see cref="LifetimeScopeBehaviour.SetResolver"/> still binds and initializes its scene</item>
-    ///     <item>A host disposing a self-built resolver whose cleanup failed surfaces the <see cref="AggregateException"/>, which Unity logs</item>
+    ///     <item>A host disposing a self-built resolver whose cleanup failed logs each failure as its own console entry and does not throw</item>
+    ///     <item><c>OnDestroy</c> clears <see cref="LifetimeScopeBehaviour.Resolver"/> for a self-built and for a supplied resolver, and leaves a supplied resolver undisposed</item>
+    ///     <item><see cref="LifetimeScopeBehaviour.SetResolver"/> after <c>Awake</c> or after <c>OnDestroy</c> throws <see cref="InvalidOperationException"/></item>
+    ///     <item>A service pass that throws in <c>Awake</c> is logged by Unity and initializes no scene component</item>
     /// </list>
     /// All fixtures are runtime-created GameObjects (no scene assets, no prefab assets); each <c>[UnityTest]</c>
     /// yields one frame so <c>Awake</c>/<c>Start</c> complete before assertions run.
@@ -56,12 +59,10 @@ namespace Didionysymus.Lattice.Tests.Runtime
         private Scene _isolatedScene;
 
         /// <summary>
-        /// Creates a fresh isolated scene for each test and sets it active so GameObjects
-        /// created via <c>new GameObject()</c> are confined to this test's scene-walk surface.
-        /// Required because the production Bootstrap.unity (registered at Build Settings index 0)
-        /// is loaded by Unity when entering PlayMode; without isolation, the PlatformProbe
-        /// in that scene leaks into every LifetimeScopeBehaviour test's scene-walk
-        /// and throws RegistrationNotFoundException for IClock against the test's container.
+        /// Creates a fresh isolated scene for each test and sets it active, so GameObjects created with
+        /// <c>new GameObject()</c> land in it and the host's scene walk sees only this test's objects. Objects in any
+        /// other loaded scene stay out of the walk, so none of their <c>[Inject]</c> members is resolved against the
+        /// test's container.
         /// </summary>
         [UnitySetUp]
         public IEnumerator UnitySetUp()
@@ -94,15 +95,15 @@ namespace Didionysymus.Lattice.Tests.Runtime
         /// <summary>
         /// When a <see cref="LifetimeScopeBehaviour"/> is added to a scene that already contains an
         /// <see cref="InjectableMonoBehaviour"/>, the consumer's <c>[Inject]</c> field must be populated
-        /// before the consumer's <c>Start</c> runs. Verifies the scene-walk in <c>Awake</c> path and
-        /// the <c>[DefaultExecutionOrder(int.MinValue + 100)]</c> ordering guarantee.
+        /// before the consumer's <c>Start</c> runs. Verifies the scene walk in <c>Awake</c>; execution order is not
+        /// pinned here.
         /// </summary>
         [UnityTest]
         public IEnumerator Awake_WhenSceneHasInjectableMonoBehaviour_PopulatesInjectFieldBeforeStart()
         {
-            // Create the consumer first so it's a scene root by the time the scope's Awake walks the scene.
-            // The scope's [DefaultExecutionOrder(int.MinValue + 100)] ensures its Awake runs before the
-            // consumer's Awake, even though the consumer was added to the scene first.
+            // Create the consumer first so it is a scene root by the time the scope's Awake walks the scene.
+            // AddComponent has already run the consumer's own Awake at that point, so this test pins "bound before
+            // Start", not Awake ordering.
             _consumerGo = new GameObject("Consumer");
             InjectableMonoBehaviour consumer = _consumerGo.AddComponent<InjectableMonoBehaviour>();
 
@@ -121,8 +122,8 @@ namespace Didionysymus.Lattice.Tests.Runtime
         /// <summary>
         /// When the scene contains a MonoBehaviour that implements <see cref="IInitializable"/>,
         /// <c>Initialize</c> runs after Phase 1 across the scene completes; injected fields are
-        /// observable inside <c>Initialize</c>. Verifies the Phase 2 walk added to
-        /// <see cref="LifetimeScopeBehaviour.InjectScene"/> via <see cref="UnityResolverExtensions.InitializeGameObject"/>.
+        /// observable inside <c>Initialize</c>. Verifies the component pass of <c>Awake</c>, which runs
+        /// <see cref="UnityResolverExtensions.InitializeGameObject"/> on every root after the scene walk.
         /// </summary>
         [UnityTest]
         public IEnumerator Awake_WhenSceneHasInitializableMonoBehaviour_InitializeSeesPopulatedField()
@@ -339,35 +340,141 @@ namespace Didionysymus.Lattice.Tests.Runtime
         }
 
         /// <summary>
-        /// A host that built its own resolver disposes it in <c>OnDestroy</c>; when a service's <c>Dispose</c> throws,
-        /// the disposal's <see cref="AggregateException"/> surfaces and Unity logs it. Unity logs an aggregate under its
-        /// innermost exception's message and names the aggregate in the logged stack trace, so the test expects the
-        /// service's message and reads the stack trace.
+        /// A host that built its own resolver disposes it in <c>OnDestroy</c>; when two services' <c>Dispose</c>
+        /// throw, each failure is logged as its own console entry, in disposal order (the later-resolved service
+        /// first), and nothing else is logged.
         /// </summary>
         /// <returns>The coroutine the test runner drives frame by frame.</returns>
         [UnityTest]
-        public IEnumerator OnDestroy_WhenSelfBuiltServiceDisposeThrows_LogsAggregateException()
+        public IEnumerator OnDestroy_WhenSelfBuiltServiceDisposeThrows_LogsEachFailure()
         {
             _scopeGo = new GameObject("ThrowingHost");
-            ThrowingDisposableHost host = _scopeGo.AddComponent<ThrowingDisposableHost>();
-            host.Resolver.Resolve<PlayModeThrowingDisposable>();
-            string loggedStackTrace = null;
-            Application.LogCallback capture = (condition, stackTrace, type) => { if (type == LogType.Exception) loggedStackTrace = stackTrace; };
-            Application.logMessageReceived += capture;
-            LogAssert.Expect(LogType.Exception, new Regex("host dispose failed"));
+            TwoThrowingDisposablesHost host = _scopeGo.AddComponent<TwoThrowingDisposablesHost>();
+            host.Resolver.Resolve<FirstThrowingDisposable>();
+            host.Resolver.Resolve<SecondThrowingDisposable>();
+            LogAssert.Expect(LogType.Exception, new Regex("second dispose failed"));
+            LogAssert.Expect(LogType.Exception, new Regex("first dispose failed"));
+
+            Object.Destroy(_scopeGo);
+            yield return null;
+
+            LogAssert.NoUnexpectedReceived();
+        }
+
+        /// <summary>
+        /// After <c>OnDestroy</c> a host that built its own resolver no longer exposes it, and the resolver it built is
+        /// disposed.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator OnDestroy_WhenSelfBuilt_ClearsResolver()
+        {
+            _scopeGo = new GameObject("RootScope");
+            TestRootScope host = _scopeGo.AddComponent<TestRootScope>();
+            IObjectResolver built = host.Resolver;
+
+            Object.Destroy(_scopeGo);
+            yield return null;
+
+            Assert.IsNull(host.Resolver, "Resolver is null after OnDestroy");
+            Assert.AreEqual(LifecycleState.Disposed, built.GetLifecycleState(), "The self-built resolver is disposed");
+        }
+
+        /// <summary>
+        /// After <c>OnDestroy</c> a host handed its resolver through <c>SetResolver</c> leaves that resolver undisposed
+        /// and no longer exposes it.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator OnDestroy_WhenResolverSupplied_LeavesItUndisposedAndClearsResolver()
+        {
+            IObjectResolver resolver = Container.Build(b => b.Register<IPlayModeService, PlayModeService>(Lifetime.Singleton));
+            _scopeGo = new GameObject("SuppliedScope");
+            _scopeGo.SetActive(false);
+            LifetimeScopeBehaviour host = _scopeGo.AddComponent<LifetimeScopeBehaviour>();
+            host.SetResolver(resolver);
 
             try
             {
+                _scopeGo.SetActive(true);
+                yield return null;
+
                 Object.Destroy(_scopeGo);
                 yield return null;
+
+                Assert.AreNotEqual(LifecycleState.Disposed, resolver.GetLifecycleState(), "A supplied resolver is left to its builder");
+                Assert.IsNull(host.Resolver, "Resolver is null after OnDestroy, whoever owned it");
             }
             finally
             {
-                Application.logMessageReceived -= capture;
+                resolver.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Once <c>Awake</c> has built the host's own resolver, <c>SetResolver</c> is refused.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator SetResolver_WhenCalledAfterAwake_ThrowsInvalidOperationException()
+        {
+            _scopeGo = new GameObject("RootScope");
+            TestRootScope host = _scopeGo.AddComponent<TestRootScope>();
+            IObjectResolver other = Container.Build(_ => { });
+
+            try
+            {
+                Assert.Throws<InvalidOperationException>(() => host.SetResolver(other), "SetResolver after Awake is refused");
+            }
+            finally
+            {
+                other.Dispose();
             }
 
+            yield return null;
+        }
+
+        /// <summary>
+        /// Once the host was destroyed, <c>SetResolver</c> is refused, although <c>Resolver</c> may be null by then.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator SetResolver_WhenCalledAfterOnDestroy_ThrowsInvalidOperationException()
+        {
+            _scopeGo = new GameObject("RootScope");
+            TestRootScope host = _scopeGo.AddComponent<TestRootScope>();
+            Object.Destroy(_scopeGo);
+            yield return null;
+            IObjectResolver other = Container.Build(_ => { });
+
+            try
+            {
+                Assert.Throws<InvalidOperationException>(() => host.SetResolver(other), "SetResolver after OnDestroy is refused");
+            }
+            finally
+            {
+                other.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// When the scope's service pass throws in <c>Awake</c>, Unity logs the exception at <c>AddComponent</c> and no
+        /// scene component is initialized.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator Awake_WhenServicePassThrows_LogsExceptionAndInitializesNoComponent()
+        {
+            _consumerGo = new GameObject("Consumer");
+            CountingInitializableMonoBehaviour consumer = _consumerGo.AddComponent<CountingInitializableMonoBehaviour>();
+            LogAssert.Expect(LogType.Exception, new Regex("region initialize failed"));
+
+            _scopeGo = new GameObject("ThrowingHost");
+            _scopeGo.AddComponent<ThrowingInitializableHost>();
+            yield return null;
+
+            Assert.AreEqual(0, consumer.InitializeCount, "A failed service pass initializes no component");
             LogAssert.NoUnexpectedReceived();
-            StringAssert.Contains("AggregateException", loggedStackTrace, "The logged exception is the disposal's aggregate");
         }
     }
 }

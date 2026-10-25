@@ -148,23 +148,54 @@ namespace Didionysymus.Lattice.Tests.Runtime.Fixtures
     }
 
     /// <summary>
-    /// <see cref="IDisposable"/> whose <c>Dispose</c> throws <see cref="NotSupportedException"/>, so a host that
-    /// disposes its resolver meets a cleanup failure.
+    /// <see cref="IDisposable"/> whose <c>Dispose</c> throws <see cref="NotSupportedException"/> with the message
+    /// <c>first dispose failed</c>; resolved before <see cref="SecondThrowingDisposable"/>, so it is disposed after it.
     /// </summary>
-    public sealed class PlayModeThrowingDisposable : IDisposable
+    public sealed class FirstThrowingDisposable : IDisposable
     {
-        public void Dispose() => throw new NotSupportedException("host dispose failed");
+        public void Dispose() => throw new NotSupportedException("first dispose failed");
     }
 
     /// <summary>
-    /// Host that builds its own resolver with <see cref="PlayModeThrowingDisposable"/> as a Singleton, so its
-    /// <c>OnDestroy</c> disposes an object that throws.
+    /// <see cref="IDisposable"/> whose <c>Dispose</c> throws <see cref="NotSupportedException"/> with the message
+    /// <c>second dispose failed</c>; resolved after <see cref="FirstThrowingDisposable"/>, so it is disposed first.
     /// </summary>
-    public sealed class ThrowingDisposableHost : LifetimeScopeBehaviour
+    public sealed class SecondThrowingDisposable : IDisposable
+    {
+        public void Dispose() => throw new NotSupportedException("second dispose failed");
+    }
+
+    /// <summary>
+    /// Host that builds its own resolver with <see cref="FirstThrowingDisposable"/> and
+    /// <see cref="SecondThrowingDisposable"/> as Singletons, so its <c>OnDestroy</c> meets two cleanup failures.
+    /// </summary>
+    public sealed class TwoThrowingDisposablesHost : LifetimeScopeBehaviour
     {
         protected override void Configure(IContainerBuilder builder)
         {
-            builder.RegisterFactory<PlayModeThrowingDisposable>(_ => new PlayModeThrowingDisposable(), Lifetime.Singleton);
+            builder.RegisterFactory<FirstThrowingDisposable>(_ => new FirstThrowingDisposable(), Lifetime.Singleton);
+            builder.RegisterFactory<SecondThrowingDisposable>(_ => new SecondThrowingDisposable(), Lifetime.Singleton);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="IInitializable"/> whose <c>Initialize</c> throws <see cref="NotSupportedException"/> with the message
+    /// <c>region initialize failed</c>, so the scope's initialization pass fails.
+    /// </summary>
+    public sealed class ThrowingRegionInitializable : IInitializable
+    {
+        public void Initialize() => throw new NotSupportedException("region initialize failed");
+    }
+
+    /// <summary>
+    /// Host that builds its own resolver with <see cref="ThrowingRegionInitializable"/> as a Singleton, so the service
+    /// pass in its <c>Awake</c> throws.
+    /// </summary>
+    public sealed class ThrowingInitializableHost : LifetimeScopeBehaviour
+    {
+        protected override void Configure(IContainerBuilder builder)
+        {
+            builder.Register<ThrowingRegionInitializable>(Lifetime.Singleton);
         }
     }
 

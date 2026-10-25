@@ -1,17 +1,18 @@
-namespace Didionysymus.Lattice.Runtime.Internal
+namespace Didionysymus.Lattice.Runtime
 {
     /// <summary>
-    /// Where a <see cref="Scope"/> is in its lifecycle. A scope starts <see cref="Created"/>, is
+    /// Where a built-in scope is in its lifecycle. A scope starts <see cref="Created"/>, is
     /// <see cref="Initializing"/> while its initialization pass runs and <see cref="Initialized"/> once it completes,
     /// is <see cref="Starting"/> while its startup runs and <see cref="Ready"/> once it completes, and becomes
     /// <see cref="Faulted"/> when a pass or startup fails or startup is cancelled; a faulted scope refuses further
     /// lifecycle calls. <c>ShutdownAsync</c> moves any live scope to <see cref="Stopping"/>, and disposal moves any
-    /// scope to <see cref="Disposed"/>.
+    /// scope to <see cref="Disposed"/>. Read it with <see cref="ResolverLifecycleExtensions.GetLifecycleState"/>. A
+    /// member may be added in a minor version; code that switches on it keeps a default branch.
     /// </summary>
-    internal enum LifecycleState
+    public enum LifecycleState
     {
         /// <summary>
-        /// Built; no initialization pass has completed.
+        /// Built; no initialization pass has completed; the pass may run.
         /// </summary>
         Created,
 
@@ -21,22 +22,23 @@ namespace Didionysymus.Lattice.Runtime.Internal
         Initializing,
 
         /// <summary>
-        /// The initialization pass completed; startup has not begun.
+        /// The initialization pass completed; startup has not begun; <c>InitializeInstance</c> and startup may run.
         /// </summary>
         Initialized,
 
         /// <summary>
-        /// Startup is running.
+        /// Startup is running; <c>InitializeInstance</c> runs, a second startup is refused.
         /// </summary>
         Starting,
 
         /// <summary>
-        /// Startup completed; every participant started.
+        /// Startup completed; every participant started; <c>InitializeInstance</c> runs, startup starts nothing.
         /// </summary>
         Ready,
 
         /// <summary>
-        /// A pass, a supplied object's initialization or startup failed, or startup was cancelled. Terminal.
+        /// A pass, a supplied object's initialization or startup failed, or startup was cancelled; every later pass,
+        /// startup and <c>InitializeInstance</c> is refused; resolves and disposal still work. Terminal.
         /// </summary>
         Faulted,
 

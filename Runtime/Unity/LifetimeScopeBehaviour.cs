@@ -13,9 +13,9 @@ namespace Didionysymus.Lattice.Runtime.Unity
     ///         orders by execution order; a script with a lower order value still runs earlier
     ///     </item>
     ///     <item>
-    ///         Two construction modes: <see cref="Configure"/> override builds a self-owned root resolver, OR
-    ///         <see cref="SetResolver"/> accepts an externally-built resolver, for example a child scope built by a
-    ///         coordinator that has already run the parent's initialization pass
+    ///         Two construction modes: a <see cref="Configure"/> override builds a self-owned root resolver, or
+    ///         <see cref="SetResolver"/> accepts an externally built resolver, for example a child scope a coordinator
+    ///         created after running the parent's initialization pass
     ///     </item>
     ///     <item>
     ///         In <c>Awake</c>: walks the scene's root GameObjects and calls <see cref="UnityResolverExtensions.InjectGameObject"/>
@@ -24,8 +24,9 @@ namespace Didionysymus.Lattice.Runtime.Unity
     ///         <see cref="IInitializable"/> component is initialized once, after the services it was bound to
     ///     </item>
     ///     <item>
-    ///         In <c>OnDestroy</c>: disposes the resolver if and only if it was self-built; externally-provided resolvers are
-    ///         owned by their builder
+    ///         In <c>OnDestroy</c>: disposes a self-built resolver and logs each cleanup failure as its own entry; never
+    ///         throws. Externally provided resolvers are owned by their builder. <see cref="Resolver"/> is null
+    ///         afterwards either way
     ///     </item>
     /// </list>
     /// </summary>
@@ -34,14 +35,18 @@ namespace Didionysymus.Lattice.Runtime.Unity
     {
         private IObjectResolver _resolver;
 
-        // Tre when this behaviour built its own resolver via Container.Build(Configure); false when an external
+        // True when this behaviour built its own resolver via Container.Build(Configure); false when an external
         // resolver was supplied via SetResolver. Drives whether OnDestroy disposes the resolver; externally-owned resolvers
         // are disposed by their builder, not by this behaviour.
         private bool _ownsResolver;
 
+        // Set by OnDestroy, so SetResolver keeps refusing a destroyed host once Resolver is cleared.
+        private bool _destroyed;
+
         /// <summary>
-        /// The active resolver. Available after <c>Awake</c> runs. Null before; consumers that need to inject
-        /// late-spawned GameObjects should use <see cref="UnityResolverExtensions.InjectGameObject"/> against this.
+        /// The active resolver. Null before <c>Awake</c> unless supplied through <see cref="SetResolver"/>, and null
+        /// after <c>OnDestroy</c>, whoever owned it; keep your own reference to use it later. Consumers that need to
+        /// inject late-spawned GameObjects should use <see cref="UnityResolverExtensions.InjectGameObject"/> against it.
         /// </summary>
         public IObjectResolver Resolver => _resolver;
 
@@ -68,22 +73,36 @@ namespace Didionysymus.Lattice.Runtime.Unity
             }
 
             // One array for both walks, so nothing is initialized that was not bound.
-            GameObject[] roots = GetSceneRoots();
-            InjectScene(roots);
-            _resolver.RunInitializables();
-            InitializeScene(roots);
+            ScopeHostEngine.Prepare(_resolver, ScopeHostEngine.GetSceneRoots(gameObject));
         }
         
         /// <summary>
-        /// Disposes the resolver only if this behaviour built it.
-        /// Externally-provided resolvers are owned and disposed by whoever called
-        /// <see cref="SetResolver"/>.
+        /// Disposes the resolver only if this behaviour built it, and logs each cleanup failure as its own console
+        /// entry instead of throwing, so a subclass's code after <c>base.OnDestroy()</c> always runs.
+        /// Externally-provided resolvers are owned and disposed by whoever called <see cref="SetResolver"/>. Clears
+        /// <see cref="Resolver"/> for either ownership.
         /// </summary>
+        /// <remarks>
+        /// A subclass that reads <see cref="Resolver"/> in its own <c>OnDestroy</c> reads it before calling
+        /// <c>base.OnDestroy()</c>.
+        /// </remarks>
         protected virtual void OnDestroy()
         {
-            if (!_ownsResolver) return;
+            _destroyed = true;
 
-            _resolver?.Dispose();
+            if (_ownsResolver)
+            {
+                try
+                {
+                    _resolver?.Dispose();
+                }
+                catch (AggregateException exception)
+                {
+                    ScopeHostEngine.LogFailures(exception, this);
+                }
+            }
+
+            _resolver = null;
         }
 
         /// <summary>
@@ -94,60 +113,21 @@ namespace Didionysymus.Lattice.Runtime.Unity
         protected virtual void Configure(IContainerBuilder builder) { }
 
         /// <summary>
-        /// Provides an externally-built resolver; used by the SceneCoordinator child-scope path where the parent is a different
-        /// scope's resolver and this behaviour merely receives the child built from it. May be called at most once, before <c>Awake</c> calling
-        /// after <c>Awake</c> or twice throws.
+        /// Supplies an externally built resolver, for example a child scope a coordinator created; call it at most
+        /// once, before <c>Awake</c>.
         /// </summary>
         /// <param name="externalResolver">The resolver to host; must not be null.</param>
-        /// <exception cref="InvalidOperationException">Thrown when a resolver is already set (either by a prior <c>SetResolver</c> call or by <c>Awake</c>'s self-build path.</exception>
+        /// <exception cref="InvalidOperationException">Thrown when a resolver is already set (by a prior <c>SetResolver</c> call or by <c>Awake</c>'s self-build path) or the host was destroyed.</exception>
         /// <exception cref="ArgumentNullException">Thrown when <paramref name="externalResolver"/> is null.</exception>
         public void SetResolver(IObjectResolver externalResolver)
         {
-            if (_resolver != null)
+            if (_resolver != null || _destroyed)
                 throw new InvalidOperationException(
-                    "Resolver is already set. SetResolver may be called at most once before Awake.");
+                    "Resolver is already set or the host was destroyed; SetResolver may be called at most once, before Awake."
+                );
 
             _resolver = externalResolver ?? throw new ArgumentNullException(nameof(externalResolver));
             _ownsResolver = false;
-        }
-
-        /// <summary>
-        /// Returns the root GameObjects of the scene this behaviour lives in, or an empty array when it is not yet
-        /// attached to a valid scene (e.g., during certain editor-only construction pathways that fire <c>Awake</c>
-        /// before scene assignment completes), so both walks silently do nothing.
-        /// </summary>
-        /// <returns>The scene's root GameObjects at the moment of the call.</returns>
-        private GameObject[] GetSceneRoots()
-        {
-            UnityEngine.SceneManagement.Scene scene = gameObject.scene;
-            return scene.IsValid() ? scene.GetRootGameObjects() : Array.Empty<GameObject>();
-        }
-
-        /// <summary>
-        /// Runs <c>InjectGameObject</c> on each of <paramref name="roots"/>, so every MonoBehaviour's <c>[Inject]</c>
-        /// members in the batch are bound before any <c>Initialize</c> body runs.
-        /// </summary>
-        /// <param name="roots">The batch: the scene's root GameObjects fixed in <see cref="Awake"/>.</param>
-        private void InjectScene(GameObject[] roots)
-        {
-            for (int i = 0; i < roots.Length; i++)
-            {
-                _resolver.InjectGameObject(roots[i]);
-            }
-        }
-
-        /// <summary>
-        /// Runs <c>InitializeGameObject</c> on each of <paramref name="roots"/>, after the scope's own initialization
-        /// pass, so a component's <c>Initialize</c> observes bound peers and initialized services and runs once per
-        /// scope.
-        /// </summary>
-        /// <param name="roots">The same batch <see cref="InjectScene"/> bound.</param>
-        private void InitializeScene(GameObject[] roots)
-        {
-            for (int i = 0; i < roots.Length; i++)
-            {
-                _resolver.InitializeGameObject(roots[i]);
-            }
         }
     }
 }
