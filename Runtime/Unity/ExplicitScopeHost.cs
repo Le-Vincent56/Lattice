@@ -27,8 +27,12 @@ namespace Didionysymus.Lattice.Runtime.Unity
     ///         call, inactive ones included, or the roots given), skipping <see cref="ScopeBoundary"/> subtrees; a given
     ///         root claims a boundary on itself, a scene root does not. It binds the walk's components that have
     ///         injection members, runs the scope's initialization pass, initializes the walk's
-    ///         <see cref="IInitializable"/> components once, then runs and awaits the scope's startup. A component
-    ///         added during the pass is in neither role. It activates and deactivates nothing
+    ///         <see cref="IInitializable"/> components once, then runs and awaits the scope's startup. When the host's
+    ///         GameObject carries a valid scene <see cref="InjectionManifest"/>, the scene batch is read from it instead
+    ///         of walked, and a given root carrying a valid hierarchy manifest is read from it likewise (exactly the
+    ///         components it lists); an unusable one is refused with <see cref="InjectionManifestException"/> before
+    ///         anything is bound, and the host stays attached. A component added during the pass is in neither role.
+    ///         It activates and deactivates nothing
     ///     </item>
     ///     <item>
     ///         One owner per object: a prepare refuses, before anything is bound and with
@@ -302,7 +306,10 @@ namespace Didionysymus.Lattice.Runtime.Unity
         /// component's or participant's <c>Initialize</c> or <c>StartAsync</c> (<see cref="Exceptions.LifecycleException"/>);
         /// the host is then faulted.
         /// </exception>
-        /// <exception cref="ScopeOwnershipException">Thrown, through the task and without any change, when the scene's batch holds another scope host outside a <see cref="ScopeBoundary"/>; the host stays attached.</exception>
+        /// <exception cref="ScopeOwnershipException">
+        /// Thrown, through the task and without any change, when the scene's batch holds another scope host outside a <see cref="ScopeBoundary"/>; the host stays attached.
+        /// </exception>
+        /// <exception cref="InjectionManifestException">Thrown, through the task and without any change, when a manifest the batch reads cannot be used; the host stays attached.</exception>
         /// <exception cref="ArgumentException">Thrown, through the task and without any change, by Unity when the host's scene is valid but not loaded.</exception>
         public Task PrepareAsync(CancellationToken cancellationToken)
         {
@@ -335,7 +342,11 @@ namespace Didionysymus.Lattice.Runtime.Unity
         /// component's or participant's <c>Initialize</c> or <c>StartAsync</c> (<see cref="Exceptions.LifecycleException"/>);
         /// the host is then faulted.
         /// </exception>
-        /// <exception cref="ScopeOwnershipException">Thrown, through the task and without any change, when the given roots overlap (one given twice or beneath another) or their walk holds another scope host outside a <see cref="ScopeBoundary"/>; the host stays attached.</exception>
+        /// <exception cref="ScopeOwnershipException">
+        /// Thrown, through the task and without any change, when the given roots overlap (one given twice or beneath another) or their walk holds another scope host
+        /// outside a <see cref="ScopeBoundary"/>; the host stays attached.
+        /// </exception>
+        /// <exception cref="InjectionManifestException">Thrown, through the task and without any change, when a manifest the batch reads cannot be used; the host stays attached.</exception>
         public Task PrepareAsync(IReadOnlyList<GameObject> roots, CancellationToken cancellationToken)
         {
             Task task = PrepareCoreAsync(roots, false, cancellationToken);
@@ -436,6 +447,7 @@ namespace Didionysymus.Lattice.Runtime.Unity
         /// <exception cref="ArgumentNullException">Thrown, through the task, when <paramref name="roots"/> is null and <paramref name="useSceneRoots"/> is false.</exception>
         /// <exception cref="Exceptions.DependencyResolutionException">Thrown, through the task, when a bind, the pass, a component's initialization or the startup failed.</exception>
         /// <exception cref="ScopeOwnershipException">Thrown, through the task, by the collect, before the host turns preparing: another host in the batch, or overlapping given roots.</exception>
+        /// <exception cref="InjectionManifestException">Thrown, through the task, by the collect, before the host turns preparing and before any ownership problem: a manifest the batch reads cannot be used.</exception>
         private async Task PrepareCoreAsync(IReadOnlyList<GameObject> roots, bool useSceneRoots, CancellationToken cancellationToken)
         {
             ScopeHostEngine.ThrowIfNotMainThread(nameof(ExplicitScopeHost) + "." + nameof(PrepareAsync));

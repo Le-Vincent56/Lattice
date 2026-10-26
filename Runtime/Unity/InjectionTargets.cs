@@ -4,9 +4,9 @@ using UnityEngine;
 namespace Didionysymus.Lattice.Runtime.Unity
 {
     /// <summary>
-    /// One walk's two ordered role lists: the components to bind and the components to initialize. Filled by discovery
-    /// now and by authored manifests later; rented from and returned to <see cref="ComponentDiscovery"/>'s main-thread
-    /// pool, so a holder never keeps it past the call that rented it.
+    /// One batch's two ordered role lists: the components to bind and the components to initialize. Filled by a walk or
+    /// from an <see cref="InjectionManifest"/>; rented from and returned to <see cref="ComponentDiscovery"/>'s
+    /// main-thread pool, so a holder never keeps it past the call that rented it.
     /// </summary>
     internal sealed class InjectionTargets
     {

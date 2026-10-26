@@ -179,3 +179,12 @@ A host initializes only the components its walk found before the service pass. A
 `IObjectResolver` that relied on seeing every component must walk the hierarchy itself. `InjectGameObject` and
 `InitializeGameObject` must be called on Unity's main thread, even with a null root, which used to return silently on
 any thread.
+
+### Optional: injection manifests
+
+Nothing changes for scenes and prefabs without an `InjectionManifest`: they are walked as before. A manifest prepares
+exactly the components it lists, so a component added after the manifest was generated is not bound or initialized
+until the manifest is rebuilt; a listed component moved inside a `ScopeBoundary` makes the manifest unusable; and an
+unusable manifest is refused with `InjectionManifestException` instead of being
+walked. During migration, set `InjectionManifest.AllowDevelopmentFallback = true` from code that runs each play session
+to walk past unusable manifests with a warning in the Editor and development players.

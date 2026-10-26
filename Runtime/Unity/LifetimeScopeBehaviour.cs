@@ -19,9 +19,11 @@ namespace Didionysymus.Lattice.Runtime.Unity
     ///     </item>
     ///     <item>
     ///         In <c>Awake</c>: walks the scene's root GameObjects once, inactive ones included and
-    ///         <see cref="ScopeBoundary"/> subtrees skipped, binds every component with injection members, runs
-    ///         <see cref="ResolverLifecycleExtensions.RunInitializables"/> for the scope's own services, then initializes
-    ///         the walk's <see cref="IInitializable"/> components once each, after the services they were bound to
+    ///         <see cref="ScopeBoundary"/> subtrees skipped, or reads the batch from a usable scene
+    ///         <see cref="InjectionManifest"/> on its own GameObject; binds every component with injection members,
+    ///         runs <see cref="ResolverLifecycleExtensions.RunInitializables"/> for the scope's own services, then
+    ///         initializes the batch's <see cref="IInitializable"/> components once each, after the services they were
+    ///         bound to
     ///     </item>
     ///     <item>
     ///         In <c>OnDestroy</c>: disposes a self-built resolver and logs each cleanup failure as its own entry; never
@@ -50,22 +52,35 @@ namespace Didionysymus.Lattice.Runtime.Unity
         /// </summary>
         public IObjectResolver Resolver => _resolver;
 
-        /// <summary>
+                /// <summary>
         /// Builds the resolver (if not already supplied externally), then walks the scene's root GameObjects once, as
         /// they are at that moment, inactive ones included and <see cref="ScopeBoundary"/> subtrees skipped: binds
         /// every component with injection members, runs the scope's initialization pass, then initializes the walk's
-        /// <see cref="IInitializable"/> components once each. A component added during the pass is in neither role;
-        /// bind and initialize it explicitly with <c>InjectGameObject</c> and <c>InitializeGameObject</c>.
+        /// <see cref="IInitializable"/> components once each. When its GameObject carries a valid scene
+        /// <see cref="InjectionManifest"/>, the batch is read from it instead of walked (exactly the components it
+        /// lists); an unusable one is refused with <see cref="InjectionManifestException"/> before anything is bound. A
+        /// component added during the pass is in neither role; bind and initialize it explicitly with
+        /// <c>InjectGameObject</c> and <c>InitializeGameObject</c>.
         /// </summary>
         /// <remarks>
         /// Subclasses that override <c>Awake</c> MUST call <c>base.Awake()</c> first; otherwise the scene walk and
         /// both initialization passes are skipped, and dependent components will see null <c>[Inject]</c> fields
         /// in their own Awake/Start callbacks. If the service pass throws, <c>Awake</c> throws before any component
         /// is initialized; a self-built resolver is still disposed in <c>OnDestroy</c>. It throws
+        /// <see cref="InjectionManifestException"/> before binding anything when its manifest cannot be used, and then
         /// <see cref="ScopeOwnershipException"/> before binding anything when its scene holds another scope host
-        /// outside a <see cref="ScopeBoundary"/>, or when it sits on or beneath a boundary itself.
+        /// outside a <see cref="ScopeBoundary"/>, or when it sits on or beneath a boundary itself; a self-built resolver
+        /// is disposed in <c>OnDestroy</c> either way.
         /// </remarks>
-        /// <exception cref="ScopeOwnershipException">Thrown before anything is bound when the scene holds another scope host outside a boundary, or this host sits inside one; the message names each object and the fix.</exception>
+        /// <exception cref="ScopeOwnershipException">
+        /// Thrown before anything is bound when the scene holds another scope host outside a boundary, or this host sits
+        /// inside one; the message names each object and the fix.
+        /// </exception>
+        /// <exception cref="InjectionManifestException">
+        /// Thrown before anything is bound, and before any ownership problem is reported, when the <see cref="InjectionManifest"/>
+        /// on this host's GameObject cannot be used and the development fallback does not apply; the message names the manifest,
+        /// each problem and the fix.
+        /// </exception>
         protected virtual void Awake()
         {
             if (_resolver == null)
