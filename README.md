@@ -274,9 +274,13 @@ public sealed class GameLifetimeScope : LifetimeScopeBehaviour
 }
 ```
 
-On `Awake` the scope builds its resolver (or takes the one given to `SetResolver` before `Awake`), injects every
-MonoBehaviour in its scene, runs `RunInitializables` for its services, then initializes the scene's `IInitializable`
-components once each; a step that throws throws out of `Awake`, and nothing starts startables. If you override
+On `Awake` the scope builds its resolver (or takes the one given to `SetResolver` before `Awake`), walks its scene
+once (inactive objects included, `ScopeBoundary` subtrees skipped), binds every MonoBehaviour of that walk that has
+`[Inject]` members, runs `RunInitializables` for its services, then initializes the walk's `IInitializable`
+components once each; a component a service adds during the pass is in neither list. A scene holds one host: when
+it holds another host outside a boundary, `Awake` throws `ScopeOwnershipException` before anything is bound (see
+[Boundaries and ownership](#boundaries-and-ownership)). A step that throws throws out of `Awake`, and nothing starts
+startables. If you override
 `Awake`, call `base.Awake()` first or the scene walk and both passes are skipped.
 `[DefaultExecutionOrder(int.MinValue + 100)]` makes this `Awake` run early among scripts Unity orders by execution
 order; it is not a guarantee against every script.
@@ -300,10 +304,12 @@ of a `LifetimeScopeBehaviour`:
    `ScopeOwnership.Borrowed` (the default value): the host never disposes it. A borrowed scope is prepared by one host
    at a time; prepare a second host after the first is ready.
 4. **Prepare.** `PrepareAsync(token)` fixes the batch as the scene's root GameObjects at the call, inactive ones
-   included; `PrepareAsync(roots, token)` uses the given roots (null and destroyed entries skipped). It binds every
-   MonoBehaviour under the batch, runs the scope's initialization pass, initializes the batch's `IInitializable`
+   included; `PrepareAsync(roots, token)` uses the given roots (null and destroyed entries skipped; they may lie in any
+   loaded scene, and each claims a `ScopeBoundary` on itself). It walks the batch once, binds every MonoBehaviour of
+   the walk that has `[Inject]` members, runs the scope's initialization pass, initializes the walk's `IInitializable`
    components once, then runs the scope's startup and awaits it. It activates nothing. A call after `Ready` prepares
-   nothing; a call while preparing is refused.
+   nothing; a call while preparing is refused. A batch holding another host outside a boundary, or overlapping given
+   roots, is refused with `ScopeOwnershipException` before anything is bound; the host stays `Attached`.
 5. **Ready only on success.** The host becomes `Ready` only after every step succeeded while it was neither cancelled
    nor shutting down. A failed step makes it `Faulted` with that exception: `PrepareAsync` and every readiness wait
    fault with it. A cancellation once preparation began (the caller's token, or the scope stopped by its parent's
@@ -335,7 +341,7 @@ of a `LifetimeScopeBehaviour`:
 ```csharp
 // In the coordinator, after the scene has loaded additively:
 IObjectResolver region = bootResolver.CreateChildScope(b => b.Register<IRegionService, RegionService>(Lifetime.Scoped));
-ExplicitScopeHost host = FindHostInLoadedScene(); // your own lookup
+ExplicitScopeHost host = ExplicitScopeHost.FindInScene(regionScene);
 host.Attach(region, ScopeOwnership.Owned);
 await host.PrepareAsync(cancellationToken);
 // elsewhere: await host.WaitUntilReadyAsync(cancellationToken);
@@ -343,6 +349,47 @@ await host.PrepareAsync(cancellationToken);
 // Before unloading the scene:
 await host.ShutdownAsync(cancellationToken);
 await SceneManager.UnloadSceneAsync(regionScene);
+```
+
+### Boundaries and ownership
+
+Both hosts and the extensions share one walk and one set of rules:
+
+1. **One walk.** Each root of a batch is walked once, inactive objects included, and both lists come from that walk:
+   the components to bind and the components to initialize. An object created, or a component added, during the
+   scope's pass is in neither; bind and initialize it explicitly. Order within a batch is not a contract.
+2. **What is touched.** Only MonoBehaviours. A component is bound when its type has an `[Inject]` field, writable
+   property or method, inherited ones included; one without is never passed to `Inject`. It is initialized when it
+   implements `IInitializable`. Missing scripts and destroyed components are skipped: a component destroyed with
+   `DestroyImmediate` during the pass is not initialized, while one removed with `Object.Destroy` is alive until the
+   end of the frame and is still initialized. `IAsyncStartable` components are not started.
+3. **Boundaries.** Put a `ScopeBoundary` on the root of a subtree another scope prepares. Every walk skips that
+   GameObject and its descendants unless it is a root passed to the call (`InjectGameObject`, `InitializeGameObject`,
+   `InstantiateAndInject`, `PrepareAsync(roots, token)`); a scene host also skips one on a scene root. A walk that
+   claims a boundary still skips the boundaries beneath it. An inactive boundary object and a disabled marker still
+   count. The marker binds, initializes and destroys nothing.
+4. **One owner.** A host's batch may hold no other scope host (`LifetimeScopeBehaviour` or `ExplicitScopeHost`, active
+   or not, enabled or not) outside a boundary, and given roots may not overlap (one given twice, or one beneath
+   another). Every violation is reported in one `ScopeOwnershipException`, raised before anything is bound, naming each
+   object as `scene/path` and the fix. The automatic host throws it from `Awake`; the explicit host faults `PrepareAsync`
+   with it, changes nothing and stays `Attached`, so it can prepare once the conflict is gone. A `LifetimeScopeBehaviour`
+   cannot sit inside a boundary; an `ExplicitScopeHost` inside one belongs to that subtree's preparer.
+   `InjectGameObject` and `InitializeGameObject` check boundaries but never hosts.
+5. **One host per scene** follows from rule 4. A host removed with `Object.Destroy` still counts until the end of the
+   frame: prepare its replacement on a later frame, or remove it with `DestroyImmediate`.
+6. **Finding a host.** `ExplicitScopeHost.FindInScene(scene)` returns a loaded scene's one explicit host, inactive ones
+   included and boundary subtrees excluded. It throws `InvalidOperationException` when there is none (even with an
+   automatic host), `ScopeOwnershipException` when there are several or an automatic host as well, and
+   `ArgumentException` for an invalid scene. It attaches and prepares nothing.
+7. **Main thread.** Discovery runs on Unity's main thread. `InjectGameObject`, `InitializeGameObject` and `FindInScene`
+   throw `InvalidOperationException` on any other thread, before touching anything, a null root included.
+
+```csharp
+// A subtree with its own scope: its root carries a ScopeBoundary, so the region's host skips it.
+// The session's host sits inside that subtree and is given its root.
+IObjectResolver session = region.CreateChildScope(b => b.Register<ISessionService, SessionService>(Lifetime.Scoped));
+sessionHost.Attach(session, ScopeOwnership.Owned);
+await sessionHost.PrepareAsync(new[] { sessionRoot }, cancellationToken);
 ```
 
 ### Member injection and the two-phase contract
@@ -385,6 +432,11 @@ resolver.InjectGameObject(spawnedGameObject);
 resolver.InitializeGameObject(spawnedGameObject);
 ```
 
+Inherited members are bound: `[Inject]` fields and properties declared on a base class, private ones included, and
+the `[Inject]` method of the most-derived class that declares one (a base class's `[Inject]` method is then not
+called). Mark an overridden property `[Inject]` on one level only: marked on both the base and the override, it is
+resolved and set twice. `InjectGameObject` and `InitializeGameObject` must be called on Unity's main thread.
+
 ## IL2CPP / AOT preservation (required for device builds)
 
 Open-generic resolution uses `MakeGenericType`, which IL2CPP strips unless the closed
@@ -408,6 +460,9 @@ builder.PreserveClosedGenerics(
 3. Apply `[UnityEngine.Scripting.Preserve]` on individual implementation types as a fallback.
 
 Forgetting this manifests as runtime exceptions on device that do not reproduce in the Editor.
+
+Preserve `[Inject]` members as well (`link.xml` or `[Preserve]`): a stripped `[Inject]` member makes its component
+look member-less, so the hosts and `InjectGameObject` skip it silently, as an unbound member was before.
 
 ## Diagnostics
 

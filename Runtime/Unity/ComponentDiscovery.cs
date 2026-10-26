@@ -1,0 +1,537 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace Didionysymus.Lattice.Runtime.Unity
+{
+    /// <summary>
+    /// Gathers a batch's components in one walk per root into <see cref="InjectionTargets"/>, by the rules both hosts
+    /// and both extensions share: only <see cref="MonoBehaviour"/>s, inactive ones included; the inject role for a
+    /// type with injection members and the initialize role for an <see cref="IInitializable"/>; null (missing-script)
+    /// and destroyed entries skipped; a <see cref="ScopeBoundary"/> subtree skipped unless its GameObject is a root
+    /// given to the call, and always on a scene root of a scene batch. For a host's batch it also refuses a second
+    /// owner with <see cref="ScopeOwnershipException"/> before anything is bound.
+    /// </summary>
+    /// <remarks>
+    /// Main thread only: the pools and the type cache are unsynchronized statics, and every entry point checks the
+    /// thread before it calls in. Targets, walk buffers and sets come from pools and are cleared before they return, so
+    /// a nested walk gets its own and no scene reference outlives the call. Each list keeps batch order, then
+    /// <c>GetComponentsInChildren</c> order per root; that order is not a contract.
+    /// </remarks>
+    internal static class ComponentDiscovery
+    {
+        // A batch holds more than one scope host outside boundaries; {0} is every host, the preparing one first.
+        internal const string HostConflictFormat = "More than one scope host owns these objects: {0}. Keep one scope host per scene, or put a ScopeBoundary on the root of each subtree another scope prepares.";
+
+        // A given root lies beneath another given root; {0} is the inner root, {1} its given ancestor.
+        private const string OverlapBeneathFormat = "The given roots overlap: {0} is beneath {1}. Give each root once.";
+
+        // A root is given more than once; {0} is the root.
+        private const string OverlapTwiceFormat = "The given roots overlap: {0} is given twice. Give each root once.";
+
+        // An automatic host sits on or beneath a boundary; {0} is the host.
+        private const string NestedHostFormat = "A LifetimeScopeBehaviour cannot sit inside a ScopeBoundary: {0}. Prepare the boundary's root with an ExplicitScopeHost or with InjectGameObject and InitializeGameObject.";
+
+        // Returned targets, cleared; Rent pops one or creates one.
+        private static readonly Stack<InjectionTargets> _targetsPool = new Stack<InjectionTargets>();
+
+        // Returned walk buffers, cleared; one per walk in progress, so a nested walk never shares the outer one.
+        private static readonly Stack<List<MonoBehaviour>> _bufferPool = new Stack<List<MonoBehaviour>>();
+
+        // Returned transform sets, cleared; rented when a walk meets a boundary below its root, and by the overlap check.
+        private static readonly Stack<HashSet<Transform>> _setPool = new Stack<HashSet<Transform>>();
+
+        // Targets, buffers and sets rented and not yet returned.
+        private static int _outstanding;
+
+        /// <summary>
+        /// Rents empty targets from the pool, creating them when the pool is empty, and counts them outstanding until
+        /// they are returned.
+        /// </summary>
+        /// <returns>Empty targets the caller owns until it passes them to <see cref="Return"/>, in a <c>finally</c>.</returns>
+        internal static InjectionTargets Rent()
+        {
+            InjectionTargets targets = _targetsPool.Count > 0 ? _targetsPool.Pop() : new InjectionTargets();
+            _outstanding++;
+            return targets;
+        }
+
+        /// <summary>
+        /// Clears <paramref name="targets"/>, returns them to the pool and counts them no longer outstanding.
+        /// </summary>
+        /// <param name="targets">Targets rented with <see cref="Rent"/>; the caller must not use them afterwards.</param>
+        internal static void Return(InjectionTargets targets)
+        {
+            targets.Clear();
+            _targetsPool.Push(targets);
+            _outstanding--;
+        }
+
+        /// <summary>
+        /// Collects a host's batch into <paramref name="targets"/>: walks each live root once, in order, skipping a
+        /// boundary on a root of a scene batch and every boundary subtree beneath a root, and adds each remaining
+        /// component's roles. On the way it records every ownership violation: <paramref name="preparingHost"/> being a
+        /// <see cref="LifetimeScopeBehaviour"/> inside a boundary; for given roots, a root given twice or beneath
+        /// another; and any host component other than <paramref name="preparingHost"/> left after boundary exclusion.
+        /// When any was recorded it throws one exception after the last root, before the caller binds anything.
+        /// </summary>
+        /// <param name="roots">The batch: the host scene's roots, or the roots given to the call; null and destroyed entries are skipped.</param>
+        /// <param name="batch">Where <paramref name="roots"/> came from, which decides boundary claims and the overlap check.</param>
+        /// <param name="preparingHost">The host preparing the batch; excluded from the host check by reference.</param>
+        /// <param name="targets">Rented targets the walk appends to; returned by the caller whatever happens.</param>
+        /// <exception cref="ScopeOwnershipException">
+        /// Thrown, after the walk, when the batch holds another host outside a boundary, the given roots overlap, or a
+        /// <see cref="LifetimeScopeBehaviour"/> prepares from inside a boundary; the message lists every violation.
+        /// </exception>
+        internal static void CollectBatch(
+            IReadOnlyList<GameObject> roots,
+            DiscoveryBatch batch,
+            MonoBehaviour preparingHost,
+            InjectionTargets targets
+        )
+        {
+            // An automatic host is always its scene's host, so one on or beneath a boundary is a violation.
+            string nestedHost = null;
+            if (preparingHost is LifetimeScopeBehaviour && preparingHost.GetComponentInParent<ScopeBoundary>(true) != null)
+                nestedHost = string.Format(NestedHostFormat, Describe(preparingHost.gameObject));
+
+            List<string> overlaps = batch == DiscoveryBatch.GivenRoots ? FindOverlaps(roots) : null;
+            List<MonoBehaviour> otherHosts = null;
+            List<MonoBehaviour> buffer = RentBuffer();
+            try
+            {
+                for (int i = 0; i < roots.Count; i++)
+                {
+                    GameObject root = roots[i];
+                    if (!root) continue;
+
+                    // A scene batch never claims a boundary on a scene root; a given root claims one on itself.
+                    if (batch == DiscoveryBatch.SceneRoots && root.TryGetComponent(out ScopeBoundary _)) continue;
+
+                    Walk(root, buffer);
+                    otherHosts = AddOtherHosts(buffer, preparingHost, otherHosts);
+                    AddRoles(buffer, targets);
+                }
+
+                if (nestedHost != null || otherHosts != null || overlaps != null)
+                    throw new ScopeOwnershipException(BuildOwnershipMessage(nestedHost, preparingHost, otherHosts, overlaps));
+            }
+            finally
+            {
+                ReturnBuffer(buffer);
+            }
+        }
+
+        /// <summary>
+        /// Collects one root for an extension into <paramref name="targets"/>: a null or destroyed root adds nothing;
+        /// otherwise one walk over it, the root claiming a boundary on itself and every boundary subtree beneath it
+        /// skipped. Hosts are ordinary components here; nothing is refused.
+        /// </summary>
+        /// <param name="root">The root passed to the extension.</param>
+        /// <param name="targets">Rented targets the walk appends to.</param>
+        internal static void CollectRoot(GameObject root, InjectionTargets targets)
+        {
+            if (!root) return;
+
+            List<MonoBehaviour> buffer = RentBuffer();
+            try
+            {
+                Walk(root, buffer);
+                AddRoles(buffer, targets);
+            }
+            finally
+            {
+                ReturnBuffer(buffer);
+            }
+        }
+
+        /// <summary>
+        /// Appends each entry of <paramref name="components"/> to <see cref="InjectionTargets.Inject"/> when its type
+        /// has the inject role and to <see cref="InjectionTargets.Initialize"/> when it has the initialize role, in
+        /// order; null (missing-script) and destroyed entries are skipped.
+        /// </summary>
+        /// <param name="components">One walk's components.</param>
+        /// <param name="targets">The targets to append to.</param>
+        internal static void AddRoles(IReadOnlyList<MonoBehaviour> components, InjectionTargets targets)
+        {
+            for (int i = 0; i < components.Count; i++)
+            {
+                MonoBehaviour component = components[i];
+                if (!component) continue;
+
+                ComponentRoles roles = ComponentTypeCache.GetRoles(component.GetType());
+                if ((roles & ComponentRoles.Inject) != 0) targets.Inject.Add(component);
+
+                if ((roles & ComponentRoles.Initialize) != 0) targets.Initialize.Add(component);
+            }
+        }
+
+        /// <summary>
+        /// Collects every host component beneath <paramref name="sceneRoots"/> into <paramref name="hosts"/>, in walk
+        /// order: <see cref="LifetimeScopeBehaviour"/>s and <see cref="ExplicitScopeHost"/>s, active or not, enabled or
+        /// not, skipping a boundary on a scene root and every boundary subtree beneath a root, as a scene batch does.
+        /// </summary>
+        /// <param name="sceneRoots">A scene's root GameObjects; null and destroyed entries are skipped.</param>
+        /// <param name="hosts">The list the hosts are appended to.</param>
+        internal static void CollectHosts(IReadOnlyList<GameObject> sceneRoots, List<MonoBehaviour> hosts)
+        {
+            List<MonoBehaviour> buffer = RentBuffer();
+            try
+            {
+                for (int i = 0; i < sceneRoots.Count; i++)
+                {
+                    GameObject root = sceneRoots[i];
+                    if (!root || root.TryGetComponent(out ScopeBoundary _)) continue;
+
+                    Walk(root, buffer);
+                    for (int j = 0; j < buffer.Count; j++)
+                    {
+                        if (IsHost(buffer[j])) hosts.Add(buffer[j]);
+                    }
+                }
+            }
+            finally
+            {
+                ReturnBuffer(buffer);
+            }
+        }
+
+        /// <summary>
+        /// Counts the entries held by every pooled collection: the pooled targets' two lists, the walk buffers and the
+        /// sets. Zero when everything returned was cleared. For tests.
+        /// </summary>
+        /// <returns>The number of references the pools hold.</returns>
+        internal static int CountPooledReferences()
+        {
+            int count = 0;
+            foreach (InjectionTargets targets in _targetsPool)
+            {
+                count += targets.Inject.Count + targets.Initialize.Count;
+            }
+
+            foreach (List<MonoBehaviour> buffer in _bufferPool)
+            {
+                count += buffer.Count;
+            }
+
+            foreach (HashSet<Transform> set in _setPool)
+            {
+                count += set.Count;
+            }
+
+            return count;
+        }
+
+        /// <summary>
+        /// Counts the targets, walk buffers and sets rented and not yet returned. Zero between calls. For tests.
+        /// </summary>
+        /// <returns>The number of outstanding rentals.</returns>
+        internal static int CountOutstandingRentals() => _outstanding;
+
+        /// <summary>
+        /// Names <paramref name="gameObject"/> for an ownership message as <c>{scene}/{names from the root down}</c>, so
+        /// objects in different scenes stay distinct.
+        /// </summary>
+        /// <param name="gameObject">The object to name.</param>
+        /// <returns>The scene's name and the hierarchy path, joined by <c>/</c>.</returns>
+        internal static string Describe(GameObject gameObject)
+        {
+            string path = gameObject.name;
+            for (Transform parent = gameObject.transform.parent; parent != null; parent = parent.parent)
+            {
+                path = parent.name + "/" + path;
+            }
+
+            return gameObject.scene.name + "/" + path;
+        }
+
+        /// <summary>
+        /// Names each component's GameObject with <see cref="Describe"/>, in order, joined by <c>"; "</c>, for
+        /// <see cref="HostConflictFormat"/>.
+        /// </summary>
+        /// <param name="components">The components to name.</param>
+        /// <returns>The joined names.</returns>
+        internal static string DescribeAll(IReadOnlyList<MonoBehaviour> components)
+        {
+            string[] names = new string[components.Count];
+            for (int i = 0; i < names.Length; i++)
+            {
+                names[i] = Describe(components[i].gameObject);
+            }
+
+            return string.Join("; ", names);
+        }
+
+        /// <summary>
+        /// Fills <paramref name="buffer"/> with one <c>GetComponentsInChildren</c> walk over <paramref name="root"/>,
+        /// inactive objects included, then drops every boundary subtree beneath the root.
+        /// </summary>
+        /// <param name="root">A live root.</param>
+        /// <param name="buffer">A rented buffer; cleared first.</param>
+        private static void Walk(GameObject root, List<MonoBehaviour> buffer)
+        {
+            buffer.Clear();
+            root.GetComponentsInChildren(true, buffer);
+            ExcludeBoundaries(root, buffer);
+        }
+
+        /// <summary>
+        /// Drops from <paramref name="buffer"/> every live component on or beneath a GameObject that carries a
+        /// <see cref="ScopeBoundary"/> below <paramref name="root"/>, keeping the order of the rest. A boundary on the
+        /// root itself is claimed and excludes nothing. Rents no set when the buffer holds no such boundary; otherwise
+        /// one parent walk per component, so the cost is components times depth whatever the number of boundaries.
+        /// Null and destroyed entries are kept for <see cref="AddRoles"/> to skip.
+        /// </summary>
+        /// <param name="root">The walk's root.</param>
+        /// <param name="buffer">The walk's components.</param>
+        private static void ExcludeBoundaries(GameObject root, List<MonoBehaviour> buffer)
+        {
+            HashSet<Transform> boundaries = null;
+            for (int i = 0; i < buffer.Count; i++)
+            {
+                MonoBehaviour component = buffer[i];
+                if (!component) continue;
+
+                if ((ComponentTypeCache.GetRoles(component.GetType()) & ComponentRoles.Boundary) == 0) continue;
+
+                if (component.gameObject == root) continue;
+
+                boundaries ??= RentSet();
+                boundaries.Add(component.transform);
+            }
+
+            if (boundaries == null) return;
+
+            try
+            {
+                Transform rootTransform = root.transform;
+                int kept = 0;
+                for (int i = 0; i < buffer.Count; i++)
+                {
+                    MonoBehaviour component = buffer[i];
+                    if (component && IsInBoundary(component.transform, rootTransform, boundaries)) continue;
+
+                    buffer[kept] = component;
+                    kept++;
+                }
+
+                buffer.RemoveRange(kept, buffer.Count - kept);
+            }
+            finally
+            {
+                ReturnSet(boundaries);
+            }
+        }
+
+        /// <summary>
+        /// Returns whether <paramref name="transform"/> or one of its ancestors below <paramref name="rootTransform"/>
+        /// is in <paramref name="boundaries"/>.
+        /// </summary>
+        /// <param name="transform">A component's transform, beneath the root or the root itself.</param>
+        /// <param name="rootTransform">The walk's root, where the parent walk stops.</param>
+        /// <param name="boundaries">The transforms of the boundaries below the root.</param>
+        /// <returns>True when the component sits on or beneath a boundary below the root.</returns>
+        private static bool IsInBoundary(Transform transform, Transform rootTransform, HashSet<Transform> boundaries)
+        {
+            for (Transform current = transform; current != null && current != rootTransform; current = current.parent)
+            {
+                if (boundaries.Contains(current)) return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Returns whether <paramref name="component"/> is live and has the host role, active or not, enabled or not.
+        /// </summary>
+        /// <param name="component">A walk entry; may be null or destroyed.</param>
+        /// <returns>True for a live <see cref="LifetimeScopeBehaviour"/> or <see cref="ExplicitScopeHost"/>.</returns>
+        private static bool IsHost(MonoBehaviour component)
+        {
+            return component && (ComponentTypeCache.GetRoles(component.GetType()) & ComponentRoles.Host) != 0;
+        }
+
+        /// <summary>
+        /// Appends every host in <paramref name="buffer"/> other than <paramref name="preparingHost"/> (compared by
+        /// reference) to <paramref name="otherHosts"/>, once each, creating the list on the first one.
+        /// </summary>
+        /// <param name="buffer">One root's walk, boundaries already excluded.</param>
+        /// <param name="preparingHost">The host preparing the batch.</param>
+        /// <param name="otherHosts">The hosts found so far; null while none was found.</param>
+        /// <returns><paramref name="otherHosts"/>, or a new list when it was null and a host was found; null otherwise.</returns>
+        private static List<MonoBehaviour> AddOtherHosts(List<MonoBehaviour> buffer, MonoBehaviour preparingHost, List<MonoBehaviour> otherHosts)
+        {
+            for (int i = 0; i < buffer.Count; i++)
+            {
+                MonoBehaviour component = buffer[i];
+                if (!IsHost(component) || ReferenceEquals(component, preparingHost)) continue;
+
+                otherHosts ??= new List<MonoBehaviour>();
+                if (!otherHosts.Contains(component)) otherHosts.Add(component);
+            }
+
+            return otherHosts;
+        }
+
+        /// <summary>
+        /// Checks given roots for overlap through one pooled set of their transforms and one parent walk per root: a
+        /// root given more than once yields one "given twice" line, at its second occurrence; a root beneath another
+        /// given root yields one "beneath" line naming its nearest given ancestor. Null and destroyed roots are skipped
+        /// first and never overlap. Lines keep root order.
+        /// </summary>
+        /// <param name="roots">The given roots.</param>
+        /// <returns>The overlap lines, or null when the roots do not overlap.</returns>
+        private static List<string> FindOverlaps(IReadOnlyList<GameObject> roots)
+        {
+            HashSet<Transform> given = RentSet();
+            try
+            {
+                bool repeated = false;
+                for (int i = 0; i < roots.Count; i++)
+                {
+                    GameObject root = roots[i];
+                    if (root && !given.Add(root.transform)) repeated = true;
+                }
+
+                List<string> overlaps = null;
+                for (int i = 0; i < roots.Count; i++)
+                {
+                    GameObject root = roots[i];
+                    if (!root) continue;
+
+                    // Only a repeat makes an occurrence count matter; without one every root is its first occurrence.
+                    int earlier = repeated ? CountEarlierOccurrences(roots, i) : 0;
+                    string line = null;
+                    if (earlier == 1)
+                    {
+                        line = string.Format(OverlapTwiceFormat, Describe(root));
+                    }
+                    else if (earlier == 0)
+                    {
+                        Transform ancestor = FindGivenAncestor(root.transform, given);
+                        if (ancestor != null) line = string.Format(OverlapBeneathFormat, Describe(root), Describe(ancestor.gameObject));
+                    }
+
+                    if (line == null) continue;
+
+                    overlaps ??= new List<string>();
+                    overlaps.Add(line);
+                }
+
+                return overlaps;
+            }
+            finally
+            {
+                ReturnSet(given);
+            }
+        }
+
+        /// <summary>
+        /// Counts how often <paramref name="roots"/>[<paramref name="index"/>] appears before <paramref name="index"/>.
+        /// </summary>
+        /// <param name="roots">The given roots.</param>
+        /// <param name="index">The position of a live root.</param>
+        /// <returns>The number of earlier entries that are the same GameObject.</returns>
+        private static int CountEarlierOccurrences(IReadOnlyList<GameObject> roots, int index)
+        {
+            int count = 0;
+            for (int i = 0; i < index; i++)
+            {
+                if (ReferenceEquals(roots[i], roots[index])) count++;
+            }
+
+            return count;
+        }
+
+        /// <summary>
+        /// Returns the nearest ancestor of <paramref name="transform"/>, its own transform excluded, that is in
+        /// <paramref name="given"/>.
+        /// </summary>
+        /// <param name="transform">A given root's transform.</param>
+        /// <param name="given">The transforms of every live given root.</param>
+        /// <returns>The nearest given ancestor, or null when there is none.</returns>
+        private static Transform FindGivenAncestor(Transform transform, HashSet<Transform> given)
+        {
+            for (Transform ancestor = transform.parent; ancestor != null; ancestor = ancestor.parent)
+            {
+                if (given.Contains(ancestor)) return ancestor;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Joins the recorded violations into one message, one line each, in the order nested host, host conflict
+        /// (the preparing host first, then the others in walk order), overlaps in root order.
+        /// </summary>
+        /// <param name="nestedHost">The nested-host line, or null.</param>
+        /// <param name="preparingHost">The host preparing the batch.</param>
+        /// <param name="otherHosts">The other hosts found, or null.</param>
+        /// <param name="overlaps">The overlap lines, or null.</param>
+        /// <returns>The lines joined by <c>"\n"</c>.</returns>
+        private static string BuildOwnershipMessage(
+            string nestedHost,
+            MonoBehaviour preparingHost,
+            List<MonoBehaviour> otherHosts,
+            List<string> overlaps
+        )
+        {
+            List<string> lines = new List<string>();
+            if (nestedHost != null) lines.Add(nestedHost);
+
+            if (otherHosts != null)
+            {
+                List<MonoBehaviour> hosts = new List<MonoBehaviour>(otherHosts.Count + 1) { preparingHost };
+                hosts.AddRange(otherHosts);
+                lines.Add(string.Format(HostConflictFormat, DescribeAll(hosts)));
+            }
+
+            if (overlaps != null) lines.AddRange(overlaps);
+
+            return string.Join("\n", lines);
+        }
+
+        /// <summary>
+        /// Rents an empty walk buffer, creating one when the pool is empty, and counts it outstanding.
+        /// </summary>
+        /// <returns>An empty buffer the caller returns with <see cref="ReturnBuffer"/>.</returns>
+        private static List<MonoBehaviour> RentBuffer()
+        {
+            List<MonoBehaviour> buffer = _bufferPool.Count > 0 ? _bufferPool.Pop() : new List<MonoBehaviour>();
+            _outstanding++;
+            return buffer;
+        }
+
+        /// <summary>
+        /// Clears <paramref name="buffer"/>, returns it to the pool and counts it no longer outstanding.
+        /// </summary>
+        /// <param name="buffer">A buffer rented with <see cref="RentBuffer"/>.</param>
+        private static void ReturnBuffer(List<MonoBehaviour> buffer)
+        {
+            buffer.Clear();
+            _bufferPool.Push(buffer);
+            _outstanding--;
+        }
+
+        /// <summary>
+        /// Rents an empty transform set, creating one when the pool is empty, and counts it outstanding.
+        /// </summary>
+        /// <returns>An empty set the caller returns with <see cref="ReturnSet"/>.</returns>
+        private static HashSet<Transform> RentSet()
+        {
+            HashSet<Transform> set = _setPool.Count > 0 ? _setPool.Pop() : new HashSet<Transform>();
+            _outstanding++;
+            return set;
+        }
+
+        /// <summary>
+        /// Clears <paramref name="set"/>, returns it to the pool and counts it no longer outstanding.
+        /// </summary>
+        /// <param name="set">A set rented with <see cref="RentSet"/>.</param>
+        private static void ReturnSet(HashSet<Transform> set)
+        {
+            set.Clear();
+            _setPool.Push(set);
+            _outstanding--;
+        }
+    }
+}

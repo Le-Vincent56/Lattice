@@ -56,6 +56,31 @@ namespace Didionysymus.Lattice.Runtime.Internal
         public static InjectionPlan GetPlan(Type type) => _plans.GetOrAdd(type, BuildPlan);
 
         /// <summary>
+        /// Whether <c>Inject</c> has anything to bind on an instance of <paramref name="type"/>: an <c>[Inject]</c>
+        /// field, writable property or method declared on it or a base class. True when the plan cannot be built.
+        /// </summary>
+        /// <param name="type">The concrete type whose injection plan is read, building and caching it on first request.</param>
+        /// <returns>
+        /// <c>true</c> when the plan has a member or a method, or when building the plan throws; <c>false</c> when the
+        /// plan is empty.
+        /// </returns>
+        internal static bool HasInjectionMembers(Type type)
+        {
+            InjectionPlan plan;
+            try
+            {
+                plan = GetPlan(type);
+            }
+            catch (Exception)
+            {
+                // The bind calls GetPlan again and reports the failure, as it did before this check existed.
+                return true;
+            }
+
+            return plan.Members.Length > 0 || plan.Method != null;
+        }
+        
+        /// <summary>
         /// Builds a complete <see cref="InjectionPlan"/> for <paramref name="type"/> by walking the type hierarchy
         /// from most-derived to (but not including) <see cref="object"/>. Discovers ever <c>[Inject]</c>-annotated field and property declared
         /// on each level (private members included), then resolves the at-most-one <c>[Inject]</c> method via <see cref="BuildInjectMethod"/>.

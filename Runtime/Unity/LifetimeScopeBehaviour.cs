@@ -18,10 +18,10 @@ namespace Didionysymus.Lattice.Runtime.Unity
     ///         created after running the parent's initialization pass
     ///     </item>
     ///     <item>
-    ///         In <c>Awake</c>: walks the scene's root GameObjects and calls <see cref="UnityResolverExtensions.InjectGameObject"/>
-    ///         on each, runs <see cref="ResolverLifecycleExtensions.RunInitializables"/> for the scope's own services,
-    ///         then calls <see cref="UnityResolverExtensions.InitializeGameObject"/> on each root so every
-    ///         <see cref="IInitializable"/> component is initialized once, after the services it was bound to
+    ///         In <c>Awake</c>: walks the scene's root GameObjects once, inactive ones included and
+    ///         <see cref="ScopeBoundary"/> subtrees skipped, binds every component with injection members, runs
+    ///         <see cref="ResolverLifecycleExtensions.RunInitializables"/> for the scope's own services, then initializes
+    ///         the walk's <see cref="IInitializable"/> components once each, after the services they were bound to
     ///     </item>
     ///     <item>
     ///         In <c>OnDestroy</c>: disposes a self-built resolver and logs each cleanup failure as its own entry; never
@@ -51,18 +51,21 @@ namespace Didionysymus.Lattice.Runtime.Unity
         public IObjectResolver Resolver => _resolver;
 
         /// <summary>
-        /// Builds the resolver (if not already supplied externally), fixes the batch as the scene's root GameObjects
-        /// at that moment, binds every MonoBehaviour beneath them, runs the scope's initialization pass, then
-        /// initializes the batch's <see cref="IInitializable"/> components once each. An object created during the
-        /// pass is in neither walk; bind and initialize it explicitly with <c>InjectGameObject</c> and
-        /// <c>InitializeGameObject</c>.
+        /// Builds the resolver (if not already supplied externally), then walks the scene's root GameObjects once, as
+        /// they are at that moment, inactive ones included and <see cref="ScopeBoundary"/> subtrees skipped: binds
+        /// every component with injection members, runs the scope's initialization pass, then initializes the walk's
+        /// <see cref="IInitializable"/> components once each. A component added during the pass is in neither role;
+        /// bind and initialize it explicitly with <c>InjectGameObject</c> and <c>InitializeGameObject</c>.
         /// </summary>
         /// <remarks>
         /// Subclasses that override <c>Awake</c> MUST call <c>base.Awake()</c> first; otherwise the scene walk and
         /// both initialization passes are skipped, and dependent components will see null <c>[Inject]</c> fields
         /// in their own Awake/Start callbacks. If the service pass throws, <c>Awake</c> throws before any component
-        /// is initialized; a self-built resolver is still disposed in <c>OnDestroy</c>.
+        /// is initialized; a self-built resolver is still disposed in <c>OnDestroy</c>. It throws
+        /// <see cref="ScopeOwnershipException"/> before binding anything when its scene holds another scope host
+        /// outside a <see cref="ScopeBoundary"/>, or when it sits on or beneath a boundary itself.
         /// </remarks>
+        /// <exception cref="ScopeOwnershipException">Thrown before anything is bound when the scene holds another scope host outside a boundary, or this host sits inside one; the message names each object and the fix.</exception>
         protected virtual void Awake()
         {
             if (_resolver == null)
@@ -72,8 +75,17 @@ namespace Didionysymus.Lattice.Runtime.Unity
                 _ownsResolver = true;
             }
 
-            // One array for both walks, so nothing is initialized that was not bound.
-            ScopeHostEngine.Prepare(_resolver, ScopeHostEngine.GetSceneRoots(gameObject));
+            // One walk feeds both roles, so nothing is initialized that the walk did not find before the pass.
+            InjectionTargets targets = ComponentDiscovery.Rent();
+            try
+            {
+                ComponentDiscovery.CollectBatch(ScopeHostEngine.GetSceneRoots(gameObject), DiscoveryBatch.SceneRoots, this, targets);
+                ScopeHostEngine.Prepare(_resolver, targets);
+            }
+            finally
+            {
+                ComponentDiscovery.Return(targets);
+            }
         }
         
         /// <summary>

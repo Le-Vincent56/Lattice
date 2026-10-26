@@ -159,3 +159,23 @@ them after the host is ready.
 self-built resolver are logged one per entry and no longer thrown, so code in a subclass's `OnDestroy` after
 `base.OnDestroy()` always runs. A subclass that reads `Resolver` in its own `OnDestroy` reads it before calling
 `base.OnDestroy()`.
+
+### One scope host per scene, and ScopeBoundary for sub-scopes
+
+A scene may hold one scope host (`LifetimeScopeBehaviour` or `ExplicitScopeHost`). A second host outside a
+`ScopeBoundary` makes the host refuse with `ScopeOwnershipException` before anything is bound: the automatic host throws
+from `Awake`, the explicit host faults `PrepareAsync`. To give a subtree its own scope, put a `ScopeBoundary` on its root
+and prepare that root with the child scope (an `ExplicitScopeHost` given the root, or `InjectGameObject` then
+`InitializeGameObject` with the child resolver); the scene's host then skips it. A `LifetimeScopeBehaviour` cannot sit
+inside a boundary: it is always its scene's host. A host removed with `Object.Destroy` still counts until the end of
+the frame; prepare its replacement on a later frame, or use `DestroyImmediate`. Find the explicit host of a loaded
+scene with `ExplicitScopeHost.FindInScene(scene)` instead of a lookup of your own.
+
+### One walk per batch
+
+A host initializes only the components its walk found before the service pass. A component that a service's
+`Initialize` adds beneath a scene root is no longer initialized by the host; call `InjectGameObject` and
+`InitializeGameObject` on it. A MonoBehaviour with no `[Inject]` members is no longer passed to `Inject`; a custom
+`IObjectResolver` that relied on seeing every component must walk the hierarchy itself. `InjectGameObject` and
+`InitializeGameObject` must be called on Unity's main thread, even with a null root, which used to return silently on
+any thread.

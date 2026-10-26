@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace Didionysymus.Lattice.Runtime.Unity
 {
@@ -22,10 +23,20 @@ namespace Didionysymus.Lattice.Runtime.Unity
     ///         <see cref="ScopeOwnership.Borrowed"/> one never is. A borrowed scope is prepared by one host at a time
     ///     </item>
     ///     <item>
-    ///         <see cref="PrepareAsync(CancellationToken)"/> binds the batch (the scene's root GameObjects at the call,
-    ///         inactive ones included, or the roots given), runs the scope's initialization pass, initializes the
-    ///         batch's <see cref="IInitializable"/> components once, then runs and awaits the scope's startup. It
-    ///         activates and deactivates nothing
+    ///         <see cref="PrepareAsync(CancellationToken)"/> walks the batch once (the scene's root GameObjects at the
+    ///         call, inactive ones included, or the roots given), skipping <see cref="ScopeBoundary"/> subtrees; a given
+    ///         root claims a boundary on itself, a scene root does not. It binds the walk's components that have
+    ///         injection members, runs the scope's initialization pass, initializes the walk's
+    ///         <see cref="IInitializable"/> components once, then runs and awaits the scope's startup. A component
+    ///         added during the pass is in neither role. It activates and deactivates nothing
+    ///     </item>
+    ///     <item>
+    ///         One owner per object: a prepare refuses, before anything is bound and with
+    ///         <see cref="ScopeOwnershipException"/>, a batch that holds another scope host outside a
+    ///         <see cref="ScopeBoundary"/> (active or not, enabled or not) or given roots that overlap; the host stays
+    ///         attached and may prepare once the conflict is gone. A host removed with <c>Object.Destroy</c> still counts
+    ///         until the end of the frame. An explicit host inside a boundary belongs to that subtree's preparer.
+    ///         <see cref="FindInScene"/> returns a scene's one explicit host by the same rules
     ///     </item>
     ///     <item>
     ///         The host becomes <see cref="ScopeHostState.Ready"/> only when every step succeeded while it was neither
@@ -100,7 +111,13 @@ namespace Didionysymus.Lattice.Runtime.Unity
 
         // The message of the AggregateException a shutdown throws when a cancellation callback or the disposal threw.
         private const string ShutdownFailureMessage = "One or more objects threw while the host shut its scope down; the scope was still shut down.";
+        
+        // FindInScene refuses an invalid scene.
+        private const string InvalidSceneMessage = "The scene is not valid.";
 
+        // FindInScene finds no explicit host; {0} is the scene's name.
+        private const string NoHostFormat = "Scene '{0}' has no ExplicitScopeHost outside a ScopeBoundary.";
+        
         // The settle source of the prepare whose startup is awaiting on this logical call chain. Set immediately before
         // the startup await, so it flows into every participant and whatever a participant starts; the async method's
         // own execution context keeps it from reaching the caller. Compared with the current prepare's settle source,
@@ -186,7 +203,7 @@ namespace Didionysymus.Lattice.Runtime.Unity
         /// <exception cref="ObjectDisposedException">Thrown when <paramref name="resolver"/> is disposed.</exception>
         public void Attach(IObjectResolver resolver, ScopeOwnership ownership)
         {
-            ScopeHostEngine.ThrowIfNotMainThread(nameof(Attach));
+            ScopeHostEngine.ThrowIfNotMainThread(nameof(ExplicitScopeHost) + "." + nameof(Attach));
 
             if (resolver == null) throw new ArgumentNullException(nameof(resolver));
 
@@ -219,13 +236,54 @@ namespace Didionysymus.Lattice.Runtime.Unity
             _fault = null;
             _state = ScopeHostState.Attached;
         }
+        
+        /// <summary>
+        /// Returns the one <see cref="ExplicitScopeHost"/> in <paramref name="scene"/>, for a coordinator that loaded
+        /// the scene. Searches the scene's root GameObjects, inactive ones included, skipping <see cref="ScopeBoundary"/>
+        /// subtrees as a scene batch does, so a host inside a boundary belongs to that subtree's preparer and is not
+        /// found. Attaches and prepares nothing.
+        /// </summary>
+        /// <param name="scene">The scene to search; it must be valid and loaded.</param>
+        /// <returns>The scene's one explicit host.</returns>
+        /// <exception cref="InvalidOperationException">Thrown when called off Unity's main thread, or when the scene has no explicit host outside a boundary, even when it holds an automatic one.</exception>
+        /// <exception cref="ScopeOwnershipException">Thrown when the scene holds more than one explicit host, or an explicit and an automatic host, outside boundaries.</exception>
+        /// <exception cref="ArgumentException">Thrown when <paramref name="scene"/> is not valid (a default or closed scene), and by Unity when it is valid but not loaded.</exception>
+        public static ExplicitScopeHost FindInScene(Scene scene)
+        {
+            ScopeHostEngine.ThrowIfNotMainThread(nameof(ExplicitScopeHost) + "." + nameof(FindInScene));
+
+            if (!scene.IsValid()) throw new ArgumentException(InvalidSceneMessage, nameof(scene));
+
+            // Unity throws ArgumentException for a valid scene that is not loaded; it passes through unchanged.
+            GameObject[] roots = scene.GetRootGameObjects();
+            List<MonoBehaviour> hosts = new List<MonoBehaviour>();
+            ComponentDiscovery.CollectHosts(roots, hosts);
+
+            ExplicitScopeHost found = null;
+            for (int i = 0; i < hosts.Count; i++)
+            {
+                if (hosts[i] is not ExplicitScopeHost host) continue;
+
+                found = host;
+                break;
+            }
+
+            if (!found) throw new InvalidOperationException(string.Format(NoHostFormat, scene.name));
+
+            if (hosts.Count > 1)
+                throw new ScopeOwnershipException(string.Format(ComponentDiscovery.HostConflictFormat, ComponentDiscovery.DescribeAll(hosts)));
+
+            return found;
+        }
 
         /// <summary>
         /// Prepares this host's scene: fixes the batch as the scene's root GameObjects at the call, inactive roots
-        /// included, binds every MonoBehaviour beneath them, runs the scope's initialization pass, initializes the
-        /// batch's <see cref="IInitializable"/> components once each, then runs the scope's startup and awaits it on
-        /// the caller's context. Activates nothing. A call on a ready host prepares nothing; a call while one runs is
-        /// refused. Every failure arrives through the returned task.
+        /// included, and walks it once, skipping a <see cref="ScopeBoundary"/> on a root and every boundary subtree
+        /// beneath one; binds every component with injection members, runs the scope's initialization pass,
+        /// initializes the walk's <see cref="IInitializable"/> components once each, then runs the scope's startup and
+        /// awaits it on the caller's context. A component added during the pass is in neither role. Activates nothing.
+        /// A call on a ready host prepares nothing; a call while one runs is refused. Every failure arrives through
+        /// the returned task.
         /// </summary>
         /// <param name="cancellationToken">Already cancelled at the call, it changes nothing; cancelled once preparation began, it cancels the scope's startup and faults the host.</param>
         /// <returns>
@@ -244,6 +302,7 @@ namespace Didionysymus.Lattice.Runtime.Unity
         /// component's or participant's <c>Initialize</c> or <c>StartAsync</c> (<see cref="Exceptions.LifecycleException"/>);
         /// the host is then faulted.
         /// </exception>
+        /// <exception cref="ScopeOwnershipException">Thrown, through the task and without any change, when the scene's batch holds another scope host outside a <see cref="ScopeBoundary"/>; the host stays attached.</exception>
         /// <exception cref="ArgumentException">Thrown, through the task and without any change, by Unity when the host's scene is valid but not loaded.</exception>
         public Task PrepareAsync(CancellationToken cancellationToken)
         {
@@ -254,8 +313,9 @@ namespace Didionysymus.Lattice.Runtime.Unity
 
         /// <summary>
         /// Prepares the given roots as the batch, as <see cref="PrepareAsync(CancellationToken)"/> prepares the scene's
-        /// roots. The batch is copied from <paramref name="roots"/> at the call; null and destroyed entries are
-        /// skipped. Every failure arrives through the returned task.
+        /// roots, except that each given root claims a <see cref="ScopeBoundary"/> on itself; boundaries beneath a root
+        /// are still skipped. The roots may lie in any loaded scene. The batch is copied from <paramref name="roots"/>
+        /// at the call; null and destroyed entries are skipped. Every failure arrives through the returned task.
         /// </summary>
         /// <param name="roots">The root GameObjects to prepare.</param>
         /// <param name="cancellationToken">Already cancelled at the call, it changes nothing; cancelled once preparation began, it cancels the scope's startup and faults the host.</param>
@@ -275,6 +335,7 @@ namespace Didionysymus.Lattice.Runtime.Unity
         /// component's or participant's <c>Initialize</c> or <c>StartAsync</c> (<see cref="Exceptions.LifecycleException"/>);
         /// the host is then faulted.
         /// </exception>
+        /// <exception cref="ScopeOwnershipException">Thrown, through the task and without any change, when the given roots overlap (one given twice or beneath another) or their walk holds another scope host outside a <see cref="ScopeBoundary"/>; the host stays attached.</exception>
         public Task PrepareAsync(IReadOnlyList<GameObject> roots, CancellationToken cancellationToken)
         {
             Task task = PrepareCoreAsync(roots, false, cancellationToken);
@@ -297,7 +358,7 @@ namespace Didionysymus.Lattice.Runtime.Unity
         /// <exception cref="OperationCanceledException">Thrown, through the task, when the host shut down before it was ready, or when <paramref name="cancellationToken"/> was cancelled.</exception>
         public async Task WaitUntilReadyAsync(CancellationToken cancellationToken)
         {
-            ScopeHostEngine.ThrowIfNotMainThread(nameof(WaitUntilReadyAsync));
+            ScopeHostEngine.ThrowIfNotMainThread(nameof(ExplicitScopeHost) + "." + nameof(WaitUntilReadyAsync));
 
             if (_state == ScopeHostState.Detached) throw new InvalidOperationException(WaitDetachedMessage);
 
@@ -336,7 +397,7 @@ namespace Didionysymus.Lattice.Runtime.Unity
         /// </exception>
         public async Task ShutdownAsync(CancellationToken cancellationToken)
         {
-            ScopeHostEngine.ThrowIfNotMainThread(nameof(ShutdownAsync));
+            ScopeHostEngine.ThrowIfNotMainThread(nameof(ExplicitScopeHost) + "." + nameof(ShutdownAsync));
 
             if (_state == ScopeHostState.Detached) return;
 
@@ -356,14 +417,15 @@ namespace Didionysymus.Lattice.Runtime.Unity
 
         /// <summary>
         /// Runs one prepare: refuses in the order detached, stopping, faulted, preparing; returns when ready; returns
-        /// cancelled for a token already cancelled; reads the batch; all of that without changing anything. Then turns
-        /// the host <see cref="ScopeHostState.Preparing"/>, binds and initializes the batch through the shared engine,
-        /// and awaits the scope's startup with a token linked to the caller's and the attach's, on the caller's
-        /// context. Its outcome is decided only while it is current (same generation, still preparing): ready on
-        /// success; faulted with readiness cancelled for a cancellation; faulted with readiness faulted for any other
-        /// exception. A prepare that is no longer current changes nothing and ends with what it observed, so no
-        /// failure is lost. Its finally completes the settle signal, disposes the linked source, then disposes the
-        /// attach's source when the host has moved on from that attach.
+        /// cancelled for a token already cancelled; reads the batch and collects its walk; all of that without changing
+        /// anything (targets from a failed collect are returned before the exception leaves). Then turns the host
+        /// <see cref="ScopeHostState.Preparing"/>, binds and initializes the walk through the shared engine, returns the
+        /// targets, and awaits the scope's startup with a token linked to the caller's and the attach's, on the
+        /// caller's context, so no scene reference crosses the await. Its outcome is decided only while it is current
+        /// (same generation, still preparing): ready on success; faulted with readiness cancelled for a cancellation;
+        /// faulted with readiness faulted for any other exception. A prepare that is no longer current changes
+        /// nothing and ends with what it observed, so no failure is lost. Its finally completes the settle signal,
+        /// disposes the linked source, then disposes the attach's source when the host has moved on from that attach.
         /// </summary>
         /// <param name="roots">The given batch; ignored when <paramref name="useSceneRoots"/> is true.</param>
         /// <param name="useSceneRoots">True to use the host scene's root GameObjects at the call.</param>
@@ -373,28 +435,47 @@ namespace Didionysymus.Lattice.Runtime.Unity
         /// <exception cref="OperationCanceledException">Thrown, through the task, when the token was cancelled at the call, or when a cancellation or a shutdown stopped the preparation.</exception>
         /// <exception cref="ArgumentNullException">Thrown, through the task, when <paramref name="roots"/> is null and <paramref name="useSceneRoots"/> is false.</exception>
         /// <exception cref="Exceptions.DependencyResolutionException">Thrown, through the task, when a bind, the pass, a component's initialization or the startup failed.</exception>
+        /// <exception cref="ScopeOwnershipException">Thrown, through the task, by the collect, before the host turns preparing: another host in the batch, or overlapping given roots.</exception>
         private async Task PrepareCoreAsync(IReadOnlyList<GameObject> roots, bool useSceneRoots, CancellationToken cancellationToken)
         {
-            ScopeHostEngine.ThrowIfNotMainThread(nameof(PrepareAsync));
+            ScopeHostEngine.ThrowIfNotMainThread(nameof(ExplicitScopeHost) + "." + nameof(PrepareAsync));
 
-            if (_state == ScopeHostState.Detached) throw new InvalidOperationException(PrepareDetachedMessage);
-
-            if (_state == ScopeHostState.Stopping) throw new InvalidOperationException(StoppingMessage);
-
-            if (_state == ScopeHostState.Faulted)
+            switch (_state)
             {
-                if (_fault is OperationCanceledException) throw new InvalidOperationException(CanceledFaultMessage, _fault);
-
-                throw new InvalidOperationException(string.Format(FaultedFormat, _fault.Message), _fault);
+                case ScopeHostState.Detached:
+                    throw new InvalidOperationException(PrepareDetachedMessage);
+                
+                case ScopeHostState.Stopping:
+                    throw new InvalidOperationException(StoppingMessage);
+                
+                case ScopeHostState.Faulted when _fault is OperationCanceledException:
+                    throw new InvalidOperationException(CanceledFaultMessage, _fault);
+                
+                case ScopeHostState.Faulted:
+                    throw new InvalidOperationException(string.Format(FaultedFormat, _fault.Message), _fault);
+                
+                case ScopeHostState.Preparing:
+                    throw new InvalidOperationException(PreparingMessage);
+                
+                case ScopeHostState.Ready:
+                    return;
             }
-
-            if (_state == ScopeHostState.Preparing) throw new InvalidOperationException(PreparingMessage);
-
-            if (_state == ScopeHostState.Ready) return;
 
             cancellationToken.ThrowIfCancellationRequested();
 
             GameObject[] batch = useSceneRoots ? ScopeHostEngine.GetSceneRoots(gameObject) : CopyRoots(roots);
+
+            // Collecting is still part of the refusals: a failure here returns the targets and changes nothing.
+            InjectionTargets targets = ComponentDiscovery.Rent();
+            try
+            {
+                ComponentDiscovery.CollectBatch(batch, useSceneRoots ? DiscoveryBatch.SceneRoots : DiscoveryBatch.GivenRoots, this, targets);
+            }
+            catch (Exception)
+            {
+                ComponentDiscovery.Return(targets);
+                throw;
+            }
 
             // Build in locals and change state only once every call that can throw has returned, so a refusal from
             // here on still changes nothing.
@@ -408,7 +489,16 @@ namespace Didionysymus.Lattice.Runtime.Unity
 
             try
             {
-                ScopeHostEngine.Prepare(resolver, batch);
+                // The targets go back before the startup await, so no scene reference crosses it.
+                try
+                {
+                    ScopeHostEngine.Prepare(resolver, targets);
+                }
+                finally
+                {
+                    ComponentDiscovery.Return(targets);
+                }
+
                 ThrowIfPrepareStopped(generation, linked.Token);
 
                 // A WaitUntilReadyAsync or ShutdownAsync a participant calls on this host would wait for this very
@@ -633,7 +723,7 @@ namespace Didionysymus.Lattice.Runtime.Unity
 
         /// <summary>
         /// Copies a given batch at the call, so later changes to the caller's list do not reach the prepare. Null and
-        /// destroyed entries are kept; the bind and initialize walks skip them.
+        /// destroyed entries are kept; the walk skips them.
         /// </summary>
         /// <param name="roots">The given roots.</param>
         /// <returns>A new array with the same entries.</returns>

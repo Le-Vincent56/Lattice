@@ -30,6 +30,7 @@ namespace Didionysymus.Lattice.Tests.Runtime
     ///     <item><c>OnDestroy</c> starts the same shutdown without waiting, logs each failure, and disposes at once when destroyed inside its own startup</item>
     ///     <item>Every public method refuses a caller off Unity's main thread</item>
     ///     <item>Objects in the scene receive <c>Awake</c> before preparation; their fields are bound only once <c>PrepareAsync</c> bound them</item>
+    ///     <item><c>FindInScene</c> returns a scene's one explicit host, inactive ones included and boundary subtrees excluded; it refuses a scene with none, with several hosts or an automatic one as well, an invalid scene, and a caller off the main thread</item>
     /// </list>
     /// Every scene is runtime-created (<c>SceneManager.CreateScene</c>), standing in for an additively loaded scene;
     /// there are no scene or prefab assets. Tasks are driven by yielding frames until they complete or 10 s of real
@@ -469,7 +470,7 @@ namespace Didionysymus.Lattice.Tests.Runtime
 
         /// <summary>
         /// A bind that throws faults the host and every readiness wait with that exception; the scope's pass never
-        /// ran, so the scope is not faulted.
+        /// ran, so the scope is not faulted, and every discovery rental of the prepare was returned.
         /// </summary>
         /// <returns>The coroutine the test runner drives frame by frame.</returns>
         [UnityTest]
@@ -481,6 +482,7 @@ namespace Didionysymus.Lattice.Tests.Runtime
             ExplicitScopeHost host = CreateHost();
             IObjectResolver region = CreateRegion(BuildBoot(), null);
             host.Attach(region, ScopeOwnership.Owned);
+            int rentalsBefore = ComponentDiscovery.CountOutstandingRentals();
 
             Task prepare = host.PrepareAsync(CancellationToken.None);
             yield return WaitFor(prepare);
@@ -493,6 +495,7 @@ namespace Didionysymus.Lattice.Tests.Runtime
             Assert.IsTrue(ready.IsFaulted, "Readiness faults");
             Assert.AreSame(prepare.Exception.InnerException, ready.Exception.InnerException, "Readiness faults with the same exception");
             Assert.AreEqual(LifecycleState.Created, region.GetLifecycleState(), "The pass never ran; the scope is not faulted");
+            Assert.AreEqual(rentalsBefore, ComponentDiscovery.CountOutstandingRentals(), "The failed bind returned its discovery targets");
         }
 
         /// <summary>
@@ -1388,6 +1391,158 @@ namespace Didionysymus.Lattice.Tests.Runtime
         }
 
         /// <summary>
+        /// <c>FindInScene</c> returns a scene's one explicit host.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator FindInScene_WhenSceneHasOneHost_ReturnsIt()
+        {
+            ExplicitScopeHost host = CreateHost();
+
+            ExplicitScopeHost found = ExplicitScopeHost.FindInScene(_regionScene);
+
+            Assert.AreSame(host, found, "The scene's one explicit host is returned");
+            yield return null;
+        }
+
+        /// <summary>
+        /// <c>FindInScene</c> finds a host on an inactive GameObject.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator FindInScene_WhenHostOnInactiveObject_ReturnsIt()
+        {
+            ExplicitScopeHost host = CreateHost();
+            host.gameObject.SetActive(false);
+
+            ExplicitScopeHost found = ExplicitScopeHost.FindInScene(_regionScene);
+
+            Assert.AreSame(host, found, "A host on an inactive object is found");
+            yield return null;
+        }
+
+        /// <summary>
+        /// <c>FindInScene</c> on a scene without an explicit host throws <see cref="InvalidOperationException"/>
+        /// naming the scene.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator FindInScene_WhenSceneHasNoHost_ThrowsInvalidOperationException()
+        {
+            _gameObjects.Add(new GameObject("Plain"));
+
+            InvalidOperationException exception = Assert.Throws<InvalidOperationException>(() => ExplicitScopeHost.FindInScene(_regionScene), "A scene without a host is refused");
+
+            Assert.AreEqual($"Scene '{_regionScene.name}' has no ExplicitScopeHost outside a ScopeBoundary.", exception.Message, "The message names the scene");
+            yield return null;
+        }
+
+        /// <summary>
+        /// <c>FindInScene</c> does not look inside a <see cref="ScopeBoundary"/>, so a scene whose only host sits in
+        /// one has none.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator FindInScene_WhenOnlyHostIsInsideScopeBoundary_ThrowsInvalidOperationException()
+        {
+            GameObject boundary = new GameObject("Boundary");
+            _gameObjects.Add(boundary);
+            boundary.AddComponent<ScopeBoundary>();
+            ExplicitScopeHost host = CreateHost();
+            host.transform.SetParent(boundary.transform, false);
+
+            InvalidOperationException exception = Assert.Throws<InvalidOperationException>(() => ExplicitScopeHost.FindInScene(_regionScene), "A host inside a boundary is not found");
+
+            Assert.AreEqual($"Scene '{_regionScene.name}' has no ExplicitScopeHost outside a ScopeBoundary.", exception.Message, "The message names the scene");
+            yield return null;
+        }
+
+        /// <summary>
+        /// <c>FindInScene</c> on a scene with two explicit hosts throws <see cref="ScopeOwnershipException"/>.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator FindInScene_WhenSceneHasTwoHosts_ThrowsScopeOwnershipException()
+        {
+            CreateHost();
+            CreateHost();
+
+            ScopeOwnershipException exception = Assert.Throws<ScopeOwnershipException>(() => ExplicitScopeHost.FindInScene(_regionScene), "Two hosts are refused");
+
+            StringAssert.StartsWith("More than one scope host owns these objects:", exception.Message, "The message names the conflict");
+            yield return null;
+        }
+
+        /// <summary>
+        /// <c>FindInScene</c> on a scene with an explicit host and an automatic host throws
+        /// <see cref="ScopeOwnershipException"/>; the automatic host sits on an inactive GameObject, so its
+        /// <c>Awake</c> never runs.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator FindInScene_WhenSceneHasAutomaticHostToo_ThrowsScopeOwnershipException()
+        {
+            CreateHost();
+            CreateInactiveAutomaticHost();
+
+            Assert.Throws<ScopeOwnershipException>(() => ExplicitScopeHost.FindInScene(_regionScene), "An automatic host beside the explicit one is a conflict");
+
+            yield return null;
+        }
+
+        /// <summary>
+        /// <c>FindInScene</c> called off Unity's main thread throws <see cref="InvalidOperationException"/> naming
+        /// the member.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator FindInScene_WhenCalledOffMainThread_ThrowsInvalidOperationException()
+        {
+            CreateHost();
+
+            Task<ExplicitScopeHost> find = Task.Run(() => ExplicitScopeHost.FindInScene(_regionScene));
+            yield return WaitFor(find);
+
+            Assert.IsTrue(find.IsFaulted, "The call faults");
+            Assert.IsInstanceOf<InvalidOperationException>(find.Exception.InnerException, "It is refused");
+            Assert.AreEqual("ExplicitScopeHost.FindInScene must be called on Unity's main thread.", find.Exception.InnerException.Message, "The refusal names the member and the main thread");
+        }
+
+        /// <summary>
+        /// <c>FindInScene</c> on a scene whose only host is automatic throws <see cref="InvalidOperationException"/>,
+        /// not <see cref="ScopeOwnershipException"/>: there is no explicit host and no duplicate.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator FindInScene_WhenSceneHasOnlyAutomaticHost_ThrowsInvalidOperationException()
+        {
+            CreateInactiveAutomaticHost();
+
+            InvalidOperationException exception = Assert.Throws<InvalidOperationException>(() => ExplicitScopeHost.FindInScene(_regionScene), "A scene with only an automatic host has no explicit host");
+
+            Assert.IsNotInstanceOf<ScopeOwnershipException>(exception, "No duplicate exists");
+            Assert.AreEqual($"Scene '{_regionScene.name}' has no ExplicitScopeHost outside a ScopeBoundary.", exception.Message, "The message names the scene");
+            yield return null;
+        }
+
+        /// <summary>
+        /// <c>FindInScene</c> on an invalid scene throws <see cref="ArgumentException"/> for the <c>scene</c>
+        /// parameter.
+        /// </summary>
+        /// <returns>The coroutine the test runner drives frame by frame.</returns>
+        [UnityTest]
+        public IEnumerator FindInScene_WhenSceneInvalid_ThrowsArgumentException()
+        {
+            Scene invalid = default(Scene);
+
+            ArgumentException exception = Assert.Throws<ArgumentException>(() => ExplicitScopeHost.FindInScene(invalid), "An invalid scene is refused");
+
+            Assert.AreEqual("scene", exception.ParamName, "The refusal names the parameter");
+            StringAssert.StartsWith("The scene is not valid.", exception.Message, "The message says the scene is not valid");
+            yield return null;
+        }
+
+        /// <summary>
         /// Yields frames until <paramref name="task"/> completes or 10 s of real time pass; never blocks on it.
         /// </summary>
         /// <param name="task">The task to wait for.</param>
@@ -1424,6 +1579,18 @@ namespace Didionysymus.Lattice.Tests.Runtime
             GameObject componentObject = new GameObject(name);
             _gameObjects.Add(componentObject);
             return componentObject.AddComponent<RegionComponent>();
+        }
+
+        /// <summary>
+        /// Creates a tracked, inactive GameObject named <c>Auto</c> in the active scene and adds a
+        /// <see cref="TestRootScope"/> to it, so the automatic host's <c>Awake</c> never runs.
+        /// </summary>
+        private void CreateInactiveAutomaticHost()
+        {
+            GameObject autoObject = new GameObject("Auto");
+            _gameObjects.Add(autoObject);
+            autoObject.SetActive(false);
+            autoObject.AddComponent<TestRootScope>();
         }
 
         /// <summary>
